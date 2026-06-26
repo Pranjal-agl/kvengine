@@ -1,36 +1,31 @@
-# Testing guide
+# Testing
 
-Everything you need to verify kvengine works, from unit tests to a
-real 3-node Raft cluster on your own machine.
+How to verify everything works, from the automated test suite to running a real 3-node cluster.
 
 ---
 
-## 0. Prerequisites
+## Prerequisites
 
 ```bash
-# You need Go 1.22+
-go version          # should print go1.22.x or newer
-
-# Clone and build
-cd kvengine
-go build ./...      # should produce no output (= no errors)
+go version   # need 1.22 or newer
+go build ./...   # should produce no output
 ```
 
 ---
 
-## 1. Run the full automated test suite (start here)
+## Full automated suite
 
-This single command runs every test across all packages with the race
-detector enabled:
+This runs every test across all packages with the race detector:
 
 ```bash
 go test -race ./...
 ```
 
-Expected output — every package should say `ok`, no `FAIL` lines:
+Expected output, every package should say ok:
 
 ```
 ok  kvengine/internal/linearcheck
+ok  kvengine/internal/lsm
 ok  kvengine/internal/raft
 ok  kvengine/internal/replication
 ok  kvengine/internal/server
@@ -39,8 +34,7 @@ ok  kvengine/internal/wal
 ok  kvengine/test/fault_injection
 ```
 
-Run it a second time with `-count=3` to catch any timing-sensitive flakiness
-(particularly in the Raft election tests):
+Run it a few times to catch any timing-sensitive flakiness in the Raft tests:
 
 ```bash
 go test -race -count=3 -timeout 3m ./internal/raft/...
@@ -48,141 +42,121 @@ go test -race -count=3 -timeout 3m ./internal/raft/...
 
 ---
 
-## 2. What each package's tests prove
+## Package by package
 
-### `internal/wal` — crash durability
+### internal/wal
 
 ```bash
 go test -race -v ./internal/wal/...
 ```
 
-- `TestAppendReplayRoundTrip`: write records, close, reopen, verify they're all there
-- `TestReplayMissingFile`: opening a non-existent WAL returns empty (not an error)
-- `TestReplayTornTail`: manually write half a record to simulate a crash mid-append;
-  replay must recover the clean prefix and silently drop the torn record
+- `TestAppendReplayRoundTrip`: write records, close, reopen, verify they are all there
+- `TestReplayTornTail`: manually truncate a record mid-write to simulate a crash; replay must recover the clean prefix and silently drop the torn one
+- `FuzzReadRecord`: seed corpus includes a max-length field (0xFFFFFFFF) that previously caused a 4 GB allocation; the sanity cap in ReadRecord catches it
 
-### `internal/store` — KV store correctness
+### internal/store
 
 ```bash
 go test -race -v ./internal/store/...
 ```
 
-- `TestPutGetDelete`: basic round-trip
-- `TestRestartRecoversState`: the crash-recovery integration test — write data, close (simulating shutdown), reopen, verify state survived via WAL replay
-- `TestConcurrentStress`: 50 goroutines hammering the same 20 keys; must be race-clean
-- `TestLinearizability`: 30 goroutines on 8 keys, records completion order, replays against reference model — proves the *values* are correct, not just "didn't crash"
-- Benchmarks: `go test -bench=. -benchtime=2s ./internal/store/...`
+- `TestRestartRecoversState`: write data, close, reopen, verify state survived via WAL replay
+- `TestConcurrentStress`: 50 goroutines hammering 20 keys; must pass `go test -race` cleanly
+- `TestLinearizability`: 30 goroutines on 8 keys, records completion order, replays against a reference model; proves the values are correct not just that it did not crash
 
-### `test/fault_injection` — kill-9 durability proof
+### test/fault_injection
 
 ```bash
 go test -v ./test/fault_injection/...
 ```
 
-This test takes ~30s. It spawns a real subprocess, writes records in a loop with
-fsync after each, kills it with SIGKILL at a random point 15 times, and verifies
-after each kill that no confirmed write was lost and no corruption crept in.
+This one takes about 30 seconds. It spawns a real subprocess, writes records in a loop with fsync after each, kills it with SIGKILL at a random point, and verifies no confirmed write was lost. Runs 15 times with different kill timing.
 
-Skip it during fast iteration with `-short`:
+Skip during fast iteration:
 
 ```bash
-go test -short ./...   # skips fault injection
+go test -short ./...
 ```
 
-### `internal/server` — networking
+### internal/server
 
 ```bash
 go test -race -v ./internal/server/...
 ```
 
-- `TestProtocolBasic`: PUT/GET/DEL over a real TCP connection, exact wire format
-- `TestPartialWrites`: sends a request one byte at a time over `net.Pipe` — proves the parser doesn't assume whole-message reads
-- `TestIdleTimeout`: a silent connection gets closed within `IdleTimeout`
-- `TestConcurrentClients`: 20 clients simultaneously, each verifies its own write
-- `TestSlowClientDoesNotBlockOthers`: a frozen client doesn't stall the server for others
+- `TestPartialWrites`: sends a request one byte at a time over `net.Pipe`; the parser must handle it identically to a normal request
+- `TestIdleTimeout`: a silent connection gets closed within IdleTimeout
+- `TestSlowClientDoesNotBlockOthers`: a frozen client that never reads responses does not prevent other clients from completing
 
-### `internal/replication` — leader-follower streaming
+### internal/replication
 
 ```bash
 go test -race -v ./internal/replication/...
 ```
 
-- `TestReplicationBasic`: 20 leader writes replicate to follower
-- `TestReplicationDelete`: DEL propagates correctly
-- `TestFollowerResumeAfterDisconnect`: the key test — writes batch 1, cancels follower (crash sim), writes batch 2, restarts follower, verifies all records present with no duplicates
-- `TestReplicationLagThenCatchUp`: fresh follower joins a leader that already has 30 records; replays all of them from offset 0
+- `TestFollowerResumeAfterDisconnect`: writes batch 1, cancels the follower (crash sim), writes batch 2, restarts the follower, verifies all records present with no duplicates and the right count
 
-### `internal/raft` — Raft consensus
+### internal/raft
 
 ```bash
 go test -race -v -timeout 60s ./internal/raft/...
 ```
 
-- `TestLeaderElection`: 3-node cluster elects exactly one leader (Election Safety)
-- `TestLeaderElectionFiveNodes`: same with 5 nodes
-- `TestBasicReplication`: all 3 nodes apply 4 commands in the same order
-- `TestPartitionLeaderFromFollowers`: cuts leader off, new leader elected, old can't commit
-- `TestConvergenceAfterHeal`: ex-leader's divergent log gets overwritten, all nodes agree on 10 commands after heal
-- `TestNoCommitWithoutQuorum`: isolated leader cannot commit — quorum is required
-- `TestPersistenceAcrossRestart`: node restarted from disk recovers term and log (no voting twice)
-- `TestTCPTransportCluster`: 3 nodes communicating over **real TCP loopback sockets** (not in-memory), elect a leader and agree on 5 commands
-- `TestSnapshotTruncatesLog`: log compacted to 6 entries after snapshot at index 5
+- `TestConvergenceAfterHeal`: leader gets partitioned, new leader elected, old leader's divergent log gets overwritten when partition heals, all three nodes agree on the same 10 commands
+- `TestNoCommitWithoutQuorum`: isolated leader cannot commit; proves quorum is actually required
+- `TestPersistenceAcrossRestart`: node stopped and restarted from disk recovers term and log correctly
+- `TestTCPTransportCluster`: 3 nodes over real TCP loopback sockets, not in-memory; elect a leader and replicate 5 commands
+- `TestSimPacketLoss`: 20% packet drop rate; Raft must still elect a leader and commit entries
+- `TestSimHighDropRatePartition`: 90% drop rate to one follower; cluster still makes progress with the other follower
 
-### `internal/linearcheck` — mathematical correctness proof
+### internal/lsm
+
+```bash
+go test -race -v ./internal/lsm/...
+```
+
+- `TestTombstoneAcrossLevels`: Delete in MemTable must shadow the value in L0, not fall through to it
+- `TestCompaction`: merges L0 into L1 correctly; updated keys show the new value, deleted keys are gone
+- `TestSSTableFileCountBounded`: after 20 rounds of writes and flushes, total SSTable file count stays bounded
+
+### internal/linearcheck
 
 ```bash
 go test -race -v ./internal/linearcheck/...
 ```
 
-- `TestCheckLinearizable`: a simple sequential history passes
-- `TestCheckNotLinearizable`: a provably impossible history is correctly rejected
-- `TestCheckDeleteLinearizable`: Put → Delete → Get(miss) is valid
-- `TestConcurrentStoreLinearizable`: 6 goroutines × 8 ops on 3 keys against a real Store; records every operation and verifies the entire history is linearizable
+- `TestCheckNotLinearizable`: two Gets returning different values with no Put between them is correctly identified as impossible
+- `TestConcurrentStoreLinearizable`: 6 goroutines, 8 ops each, 3 keys; records every operation against a real Store and verifies the full history is linearizable
 
 ---
 
-## 3. Manual testing — single-node server
-
-Build the binary:
+## Manual testing: single node
 
 ```bash
 go build -o kvengine ./cmd/kvengine
-```
-
-Start a single-node KV server:
-
-```bash
 ./kvengine data.wal serve :6380
 ```
 
-In a second terminal, talk to it with `nc` (the protocol is text):
+In another terminal:
 
 ```bash
-# PUT a value (key=hello, value length=5, then the 5 bytes)
 printf 'PUT hello 5\r\nworld\r\n' | nc -q1 127.0.0.1 6380
+# +OK
 
-# GET it back
 printf 'GET hello\r\n' | nc -q1 127.0.0.1 6380
-# Expected: $5\r\nworld\r\n
+# $5
+# world
 
-# DELETE it
 printf 'DEL hello\r\n' | nc -q1 127.0.0.1 6380
+# +OK
 
-# GET again (should be nil)
 printf 'GET hello\r\n' | nc -q1 127.0.0.1 6380
-# Expected: $-1\r\n
+# $-1
 ```
 
-Kill the server (Ctrl-C), restart it, and GET again — the value survives
-because it was fsynced to `data.wal`:
+Kill the server (Ctrl-C), restart it with the same command, and GET again. The value should still be gone because the DEL was fsynced before the kill.
 
-```bash
-./kvengine data.wal serve :6380 &
-printf 'GET hello\r\n' | nc -q1 127.0.0.1 6380
-# $-1\r\n  (deleted before crash — correct)
-```
-
-Clean up:
+To verify the WAL actually persists: write a value, kill the server, restart it, and GET. The value should come back.
 
 ```bash
 rm -f data.wal kvengine
@@ -190,67 +164,51 @@ rm -f data.wal kvengine
 
 ---
 
-## 4. Manual testing — 3-node Raft cluster
+## Manual testing: 3-node Raft cluster
 
-This runs 3 real processes on your machine forming a Raft cluster.
-Open **3 terminals**.
+Open 3 terminals, all in the same directory.
 
-**Terminal 1 — node 0:**
+**Terminal 1:**
 ```bash
 mkdir -p /tmp/kv/{n0,n1,n2}
-./kvengine raft \
-  --id n0 \
-  --raft-addr 127.0.0.1:7000 \
-  --kv-addr 127.0.0.1:6380 \
-  --peers "n1=127.0.0.1:7001,n2=127.0.0.1:7002" \
-  --data-dir /tmp/kv/n0
+./kvengine raft --id n0 --raft-addr 127.0.0.1:7000 --kv-addr 127.0.0.1:6380 \
+  --peers "n1=127.0.0.1:7001,n2=127.0.0.1:7002" --data-dir /tmp/kv/n0
 ```
 
-**Terminal 2 — node 1:**
+**Terminal 2:**
 ```bash
-./kvengine raft \
-  --id n1 \
-  --raft-addr 127.0.0.1:7001 \
-  --kv-addr 127.0.0.1:6381 \
-  --peers "n0=127.0.0.1:7000,n2=127.0.0.1:7002" \
-  --data-dir /tmp/kv/n1
+./kvengine raft --id n1 --raft-addr 127.0.0.1:7001 --kv-addr 127.0.0.1:6381 \
+  --peers "n0=127.0.0.1:7000,n2=127.0.0.1:7002" --data-dir /tmp/kv/n1
 ```
 
-**Terminal 3 — node 2:**
+**Terminal 3:**
 ```bash
-./kvengine raft \
-  --id n2 \
-  --raft-addr 127.0.0.1:7002 \
-  --kv-addr 127.0.0.1:6382 \
-  --peers "n0=127.0.0.1:7000,n1=127.0.0.1:7001" \
-  --data-dir /tmp/kv/n2
+./kvengine raft --id n2 --raft-addr 127.0.0.1:7002 --kv-addr 127.0.0.1:6382 \
+  --peers "n0=127.0.0.1:7000,n1=127.0.0.1:7001" --data-dir /tmp/kv/n2
 ```
 
-Wait ~1 second for leader election (you'll see `Raft listening` in each terminal).
-Then in a **4th terminal**:
+Wait about a second for election, then in a 4th terminal:
 
 ```bash
-# Write to the cluster leader (try each port if you get "not leader")
+# Try each port until one returns +OK. That node is the leader.
 printf 'PUT mykey 5\r\nhello\r\n' | nc -q1 127.0.0.1 6380
-# or 6381, or 6382 — whichever node is the leader
+printf 'PUT mykey 5\r\nhello\r\n' | nc -q1 127.0.0.1 6381
+printf 'PUT mykey 5\r\nhello\r\n' | nc -q1 127.0.0.1 6382
 
 # Read from any node (reads are local)
 printf 'GET mykey\r\n' | nc -q1 127.0.0.1 6381
 ```
 
-### Test leader failover
+**Failover test:**
 
-Kill the leader node (Ctrl-C in its terminal). Within ~400ms, the remaining
-two nodes elect a new leader. Writes to the new leader should succeed:
+Kill the leader (Ctrl-C in its terminal). The other two elect a new leader in about 400ms. Try writing to them:
 
 ```bash
 printf 'PUT afterfail 2\r\nok\r\n' | nc -q1 127.0.0.1 6381
+printf 'PUT afterfail 2\r\nok\r\n' | nc -q1 127.0.0.1 6382
 ```
 
-Restart the killed node — it rejoins, catches up from the new leader's log,
-and serves reads again.
-
-### Clean up
+One of them will accept it. Restart the killed node and it will catch up automatically from the new leader.
 
 ```bash
 rm -rf /tmp/kv kvengine
@@ -258,63 +216,60 @@ rm -rf /tmp/kv kvengine
 
 ---
 
-## 5. Run benchmarks
-
-```bash
-# Store layer (shows fsync is the bottleneck, not the mutex)
-go test -bench=. -benchtime=3s ./internal/store/...
-
-# Server over real TCP
-go test -bench=. -benchtime=3s ./internal/server/...
-```
-
-Compare `BenchmarkPutSequential` vs `BenchmarkPutParallel` vs
-`BenchmarkPutSameKeyParallel` — they should all be within noise of each other
-(~550µs), confirming fsync dominates and map sharding would not help.
-
----
-
-## 6. Specific edge-case scenarios to manually verify
-
-These aren't automated but worth poking at manually with the running server:
+## Edge cases worth trying manually
 
 **Empty value:**
 ```bash
 printf 'PUT empty 0\r\n\r\n' | nc -q1 127.0.0.1 6380
 printf 'GET empty\r\n' | nc -q1 127.0.0.1 6380
-# Expected: $0\r\n\r\n
+# $0
 ```
 
-**Binary value (the protocol is binary-safe):**
-```bash
-printf 'PUT bin 3\r\n\x01\x02\x03\r\n' | nc -q1 127.0.0.1 6380
-printf 'GET bin\r\n' | nc -q1 127.0.0.1 6380
-# Expected: $3\r\n<three binary bytes>\r\n
-```
-
-**Unknown command (should not close the connection):**
+**Unknown command (connection should stay open):**
 ```bash
 { printf 'INVALID\r\n'; printf 'GET hello\r\n'; } | nc -q1 127.0.0.1 6380
-# First line: -ERR unknown command "INVALID"
-# Second line: value or $-1 — connection was NOT closed
+# -ERR unknown command "INVALID"
+# $-1  (connection was not closed)
 ```
 
 ---
 
-## 7. What "ALL GREEN" means
+## Benchmarks
 
-When `go test -race ./...` passes:
+```bash
+# Store layer
+go test -bench=. -benchtime=3s ./internal/store/...
 
-- **No data races**: the Go race detector checked every actual concurrent
-  memory access at runtime. This is not a static analysis guess — it's
-  proof that no two goroutines touched shared memory unsafely during the
-  test run.
-- **WAL crash safety**: a real torn write on disk is correctly handled,
-  confirmed by a real SIGKILL to a real subprocess.
-- **Concurrency correctness**: 48 concurrent KV operations are
-  mathematically proven linearizable — not just "didn't crash," but
-  "produced results consistent with some valid sequential ordering."
-- **Raft safety**: election safety, log matching, and no-commit-without-quorum
-  are all demonstrated, including through injected network partitions.
-- **Persistence**: a Raft node stopped and restarted from disk recovers
-  its term and log without violating any invariants.
+# Server over real TCP
+go test -bench=. -benchtime=3s ./internal/server/...
+
+# LSM engine
+go test -bench=. -benchtime=3s ./internal/lsm/...
+```
+
+Compare `BenchmarkPutSequential` vs `BenchmarkPutParallel` vs `BenchmarkPutSameKeyParallel`. They should all be within noise of each other around 550 us. This confirms fsync is the bottleneck, not the lock.
+
+---
+
+## Fuzzing
+
+```bash
+# Fast: just run the seed corpus
+make fuzz-seeds
+
+# Full: mutate inputs for 60 seconds per target
+make fuzz FUZZ_SECS=60
+```
+
+Any crash found is saved to `testdata/fuzz/<target>/<hash>` and will be replayed automatically on the next `go test` run.
+
+---
+
+## Flamegraph
+
+```bash
+make flamegraph
+# generates profiles/cpu.svg
+```
+
+This starts the server, runs concurrent load against it for 15 seconds, and captures a CPU profile via pprof. Open the SVG in a browser. `syscall.Fsync` should be the widest bar.
