@@ -386,8 +386,17 @@ func (n *Node) becomeLeader() {
 		n.nextIndex[peer] = lastIdx + 1
 		n.matchIndex[peer] = 0
 	}
+	// Append a no-op entry for the new term (Raft §8). A leader may only
+	// commit entries from its own term by counting replicas, so without
+	// this, entries left over from earlier terms — including everything
+	// in the log after a full-cluster restart — would stay uncommitted
+	// (and unapplied) until the next client write. No-ops have a nil
+	// Command and are not delivered on applyCh.
+	n.log = append(n.log, LogEntry{Term: n.currentTerm})
+	n.persist()
 	// Immediate heartbeat asserts leadership and prevents a new election.
 	n.broadcastAppendEntries()
+	n.maybeAdvanceCommitIndex() // single-node cluster commits immediately
 }
 
 // --- Log replication ---

@@ -124,8 +124,10 @@ func (c *snapCluster) start(i int) {
 				sm.mu.Unlock()
 				continue
 			}
-			if msg.CommandIndex != sm.lastIdx+1 && sm.err == nil {
-				sm.err = fmt.Errorf("%s: applied index %d after %d (gap or reorder)", id, msg.CommandIndex, sm.lastIdx)
+			// Indices may skip (leader no-ops aren't delivered) but must
+			// strictly increase.
+			if msg.CommandIndex <= sm.lastIdx && sm.err == nil {
+				sm.err = fmt.Errorf("%s: applied index %d after %d (reorder or duplicate)", id, msg.CommandIndex, sm.lastIdx)
 			}
 			sm.applied = append(sm.applied, string(msg.Command))
 			sm.lastIdx = msg.CommandIndex
@@ -216,13 +218,15 @@ func TestReplicationContinuesAfterSnapshot(t *testing.T) {
 	// Indices returned by Propose must keep counting from the real log
 	// position, not restart from the compacted slice.
 	l := c.leader()
+	_, applied, _ := c.sms[l].get()
 	idx, _, ok := c.nodes[l].Propose([]byte("next"))
 	if !ok {
 		t.Fatal("propose failed")
 	}
-	if idx != 38 {
-		t.Fatalf("Propose after snapshots returned index %d, want 38", idx)
+	if idx <= applied {
+		t.Fatalf("Propose after snapshots returned index %d, but index %d was already applied", idx, applied)
 	}
+	c.waitState([]int{0, 1, 2}, append(want, "next"), 5*time.Second)
 }
 
 // TestLaggingFollowerCatchesUpViaInstallSnapshot: a follower is cut off

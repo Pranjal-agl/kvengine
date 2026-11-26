@@ -89,22 +89,22 @@ found:
 	}
 
 	// After snapshot at 5, the log should be shorter: entries 1-5 gone,
-	// only sentinel + entries 6-N remain.
+	// only the sentinel (standing in for index 5) + entries 6..last remain.
+	// (The last index is above N because each new leader appends a no-op.)
 	nodes[leaderIdx].mu.Lock()
 	logLen := len(nodes[leaderIdx].log)
+	lastIdx := nodes[leaderIdx].lastIndex()
 	snapIdx := nodes[leaderIdx].snapshotIndex
 	nodes[leaderIdx].mu.Unlock()
 
-	// log[0] is sentinel, log[1..] are entries 6..N → length = 1 + (N-5)
-	expectedLen := 1 + (N - 5)
-	if logLen != expectedLen {
+	if want := int(lastIdx-5) + 1; logLen != want {
 		t.Errorf("after TakeSnapshot(5): log len=%d, want %d (sentinel + entries 6..%d)",
-			logLen, expectedLen, N)
+			logLen, want, lastIdx)
 	}
 	if snapIdx != 5 {
 		t.Errorf("snapshotIndex=%d, want 5", snapIdx)
 	}
-	t.Logf("snapshot OK: log truncated to len=%d (was %d)", logLen, N+1)
+	t.Logf("snapshot OK: log truncated to len=%d (last index %d)", logLen, lastIdx)
 
 	// Verify the snapshot file is readable and has the right content.
 	snap, err := nodes[leaderIdx].LatestSnapshot()
