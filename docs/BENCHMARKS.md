@@ -1,6 +1,6 @@
 # Benchmarks
 
-All numbers from a single-vCPU sandbox (Intel Xeon @ 2.80GHz). If you run these on real multi-core hardware you will get different parallel numbers, but the single-threaded ones should be similar.
+Numbers below are from a 2-vCPU cloud VM. Before/after comparisons were run back to back on that same machine. fsync latency depends heavily on the disk (an earlier version of this doc measured ~550 us per fsync on different hardware), so compare ratios rather than absolute numbers.
 
 ```bash
 go test -bench=. -benchtime=3s ./internal/store/...
@@ -13,59 +13,73 @@ go test -bench=. -benchtime=3s ./internal/lsm/...
 ## WAL-backed store
 
 ```
-BenchmarkPutSequential        4306 reps    547913 ns/op   (~548 us/op)
-BenchmarkGetSequential    42147806 reps        51.4 ns/op
-BenchmarkGetParallel      44594617 reps        53.5 ns/op
-BenchmarkPutParallel          4023 reps    576355 ns/op   (~576 us/op, different keys)
-BenchmarkPutSameKeyParallel   3805 reps    558341 ns/op   (~558 us/op, same key)
+BenchmarkPutSequential              ~170 us/op
+BenchmarkGetSequential              ~33 ns/op
+BenchmarkPutParallel                ~170 us/op   (GOMAXPROCS=2 writers, different keys)
+BenchmarkPutSameKeyParallel         ~177 us/op   (GOMAXPROCS=2 writers, one key)
 ```
 
-Put costs about 550 us regardless of contention. Writers hitting the same key, different keys, or running with no other writers at all all measure within noise of each other. The constant is fsync, one OS round-trip to durable storage per write.
+A single writer pays one fsync per Put. Get costs about 33 ns, roughly 5,000x cheaper than Put. The RWMutex and map lookup are essentially free compared to disk I/O.
 
-Get costs about 51 ns. That is roughly 10,000x cheaper than Put. The RWMutex and map lookup are essentially free compared to disk I/O.
+### Group commit
+
+`BenchmarkPutConcurrentWriters` sweeps the number of concurrent writers. This is the number that matters for a server with many clients:
+
+```
+                     before (fsync per write)   after (group commit)
+writers=1            ~181 us/op                 ~181 us/op
+writers=8            ~163 us/op                 ~40 us/op
+writers=64           ~147 us/op                 ~6.9 us/op
+```
+
+Before, every writer paid for its own fsync, so adding writers barely helped. Now, writers that arrive while an fsync is in flight are committed together by the next one. At 64 writers, that's ~21x the throughput. A single writer is unaffected because uncontended writes commit on the caller's goroutine with no handoff (see ARCHITECTURE.md).
 
 ### Why I did not shard the map
 
-The obvious optimization for a concurrent KV store is sharding the map by key hash to reduce mutex contention. These numbers show that would be worthless. The lock costs ~50 ns. The fsync costs ~550,000 ns. Sharding the map would improve the 50 ns piece of a 550,000 ns operation.
-
-I ran the benchmarks first and made the decision based on the numbers. The sharding complexity would not have been justified by any measurable improvement.
-
-The actual lever for write throughput would be group commit: batch N pending writes, fsync once, ack them all. Not implemented yet because no workload has shown it is needed.
+The obvious optimization for a concurrent KV store is sharding the map by key hash to reduce mutex contention. These numbers show that would be worthless. The lock costs ~50 ns. The fsync costs hundreds of microseconds. Sharding the map would improve the cheap part of the operation. Group commit attacks the expensive part.
 
 ---
 
 ## Network layer
 
 ```
-BenchmarkPutGetOverTCP    3578 reps    630438 ns/op   (~630 us for PUT+GET combined)
+BenchmarkPutGetOverTCP    ~175 us/op   (PUT+GET combined, one client)
 ```
 
-A full PUT + GET over real TCP loopback costs about 630 us. The WAL Put alone costs about 550 us. So the network layer (two round trips, request parsing, response formatting) adds roughly 80 us on top, about 14% of the total. The protocol is not the bottleneck.
+A full PUT + GET over real TCP loopback costs about the same as a single WAL Put. The network layer (two round trips, request parsing, response formatting) is a small fraction of the total. The protocol is not the bottleneck.
 
 ---
 
 ## LSM engine
 
 ```
-BenchmarkLSMPut           ~250 ns/op   (in-memory MemTable write)
-BenchmarkLSMGet           ~120 ns/op   (MemTable lookup)
-BenchmarkLSMGetAfterFlush ~8 us/op     (SSTable linear scan)
+BenchmarkLSMPut               ~60 ns/op    (in-memory MemTable write)
+BenchmarkLSMGet               ~30 ns/op    (MemTable lookup)
+BenchmarkLSMGetAfterFlush     ~1.9 us/op   (1k-entry SSTable)
+BenchmarkLSMGetLargeSSTable   ~3.4 us/op   (100k-entry SSTable)
+```
+
+SSTable reads use a sparse index (every 16th key) to seek near the key, then scan at most 16 entries. Before the index, reads were a linear scan of the whole file, opened fresh on every Get:
+
+```
+                              before          after
+GetAfterFlush (1k entries)    ~29 us/op       ~1.9 us/op
+GetLargeSSTable (100k)        ~2.6 ms/op      ~3.4 us/op
 ```
 
 ### WAL store vs LSM
 
 | Property | WAL store | LSM engine |
 |---|---|---|
-| Write latency | ~550 us (fsync per write) | ~250 ns (in-memory, batch fsync) |
-| Read latency, hot | ~51 ns (map lookup) | ~120 ns (memtable lookup) |
-| Read latency, cold | ~51 ns | ~8 us (SSTable scan) |
-| Durability window | Per write | MemTable flush interval (4 MiB) |
+| Write latency | ~170 us (fsync, shared under concurrency) | ~60 ns (in-memory, fsync at flush) |
+| Read latency, hot | ~33 ns (map lookup) | ~30 ns (memtable lookup) |
+| Read latency, cold | ~33 ns (everything is in memory) | ~2-4 us (SSTable index + short scan) |
+| Durability window | Per write | MemTable flush (4 MiB) |
 | Log growth | Forever without checkpointing | Bounded by compaction |
+| Memory | All data | MemTable + sparse indexes |
 | Complexity | Low | Medium |
 
-LSM writes are about 2,000x faster than WAL writes because they avoid per-write fsync. The tradeoff is that unflushed MemTable data is lost on crash, so the durability window is larger.
-
-LSM hot reads (~120 ns) are comparable to the WAL store (~51 ns). Cold reads from SSTable (~8 us) are slower because they require a file scan. A production LSM like LevelDB or RocksDB uses bloom filters and sparse indexes to bring this down to sub-microsecond. The implementation here is the correct but naive version.
+The remaining gap to production LSMs (LevelDB, RocksDB) for reads is bloom filters, which let a lookup skip a file without touching its index, and block caching.
 
 ---
 
@@ -93,8 +107,9 @@ If you ever want to improve write throughput, that is where to look. Not the par
 
 Every performance decision in this project was made after looking at numbers, not before:
 
-- No map sharding: benchmarks showed the mutex is 10,000x cheaper than fsync.
-- No protocol optimization: the network layer adds 14% on top of the fsync floor.
-- No group commit: no benchmark has shown write throughput is an actual bottleneck.
+- No map sharding: benchmarks showed the mutex is thousands of times cheaper than fsync.
+- No protocol optimization: the network layer is a small fraction of the fsync floor.
+- Group commit: added once a concurrent-writers benchmark showed fsync-per-write left ~20x throughput on the table under load. The first version (a committer goroutine) cost ~30 us per write on the TCP benchmark from goroutine wakeups, so it was replaced with the leader pattern that keeps uncontended writes on the caller's goroutine.
+- LSM sparse index: a 100k-entry table made the linear scan's cost (milliseconds) obvious.
 
-Running benchmarks before deciding whether to optimize is what prevents wasted effort on changes that would not matter.
+Running benchmarks before deciding whether to optimize is what prevents wasted effort on changes that would not matter, and running them after is what catches the ones that cost more than they should.

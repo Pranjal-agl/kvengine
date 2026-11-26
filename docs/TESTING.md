@@ -27,6 +27,7 @@ Expected output, every package should say ok:
 ok  kvengine/internal/linearcheck
 ok  kvengine/internal/lsm
 ok  kvengine/internal/raft
+ok  kvengine/internal/raftkv
 ok  kvengine/internal/replication
 ok  kvengine/internal/server
 ok  kvengine/internal/store
@@ -37,7 +38,7 @@ ok  kvengine/test/fault_injection
 Run it a few times to catch any timing-sensitive flakiness in the Raft tests:
 
 ```bash
-go test -race -count=3 -timeout 3m ./internal/raft/...
+go test -race -count=3 -timeout 3m ./internal/raft/... ./internal/raftkv/...
 ```
 
 ---
@@ -52,6 +53,7 @@ go test -race -v ./internal/wal/...
 
 - `TestAppendReplayRoundTrip`: write records, close, reopen, verify they are all there
 - `TestReplayTornTail`: manually truncate a record mid-write to simulate a crash; replay must recover the clean prefix and silently drop the torn one
+- `TestOpenTruncatesTornTail`: Open must cut the torn tail off the file (saving it to `.corrupt-<offset>`) so records appended afterwards are replayable
 - `FuzzReadRecord`: seed corpus includes a max-length field (0xFFFFFFFF) that previously caused a 4 GB allocation; the sanity cap in ReadRecord catches it
 
 ### internal/store
@@ -62,7 +64,10 @@ go test -race -v ./internal/store/...
 
 - `TestRestartRecoversState`: write data, close, reopen, verify state survived via WAL replay
 - `TestConcurrentStress`: 50 goroutines hammering 20 keys; must pass `go test -race` cleanly
-- `TestLinearizability`: 30 goroutines on 8 keys, records completion order, replays against a reference model; proves the values are correct not just that it did not crash
+- `TestLinearizability`: 30 goroutines on 8 keys; each key's final value must come from a write not strictly followed (in real time) by another write to that key
+- `TestConcurrentSameKeyMemoryMatchesLog`: memory state before a restart must equal WAL replay after it, under concurrent writes to the same keys
+- `TestWritesAfterTornTailSurviveSecondRestart`: crash with a torn tail, restart, write, restart again; every acknowledged write must survive
+- `TestRestoreSnapshotReplacesState`, `TestSnapshotBinarySafe`: snapshots replace (not merge) state and round-trip binary keys/values
 
 ### test/fault_injection
 
@@ -108,6 +113,23 @@ go test -race -v -timeout 60s ./internal/raft/...
 - `TestTCPTransportCluster`: 3 nodes over real TCP loopback sockets, not in-memory; elect a leader and replicate 5 commands
 - `TestSimPacketLoss`: 20% packet drop rate; Raft must still elect a leader and commit entries
 - `TestSimHighDropRatePartition`: 90% drop rate to one follower; cluster still makes progress with the other follower
+- `TestVoteNotResetBySameTermHeartbeat`: a node that voted in term T must not vote again in T after a heartbeat (Election Safety)
+- `TestReplicationContinuesAfterSnapshot`: every node snapshots every 5 entries; replication and apply keep working long after the first compaction
+- `TestLaggingFollowerCatchesUpViaInstallSnapshot`: a partitioned follower falls behind the leader's snapshot and catches up via InstallSnapshot
+- `TestRestartWithSnapshotKeepsIndices`: a node restarted from snapshot + persisted log tail rejoins with correct absolute indices
+
+### internal/raftkv
+
+```bash
+go test -race -v ./internal/raftkv/...
+```
+
+- `TestPutIsAppliedBeforeReturning`: an acknowledged Put is immediately visible on the leader and eventually on every follower
+- `TestIsolatedLeaderDoesNotAcknowledge`: a leader cut off from its quorum must not return success, and its unacknowledged write never appears on the majority side
+- `TestFollowerRejectsWrites`: writes to a follower fail with the leader's ID
+- `TestBinarySafeThroughRaftAndSnapshots`: non-UTF-8 keys and values survive the Raft log, snapshots, and a restart
+- `TestFullClusterRestartRecoversState`: stop all nodes, start them again; all state comes back without any new write
+- `TestLaggingFollowerCatchesUpWithSnapshot`: end-to-end InstallSnapshot through the KV layer
 
 ### internal/lsm
 
@@ -116,6 +138,10 @@ go test -race -v ./internal/lsm/...
 ```
 
 - `TestTombstoneAcrossLevels`: Delete in MemTable must shadow the value in L0, not fall through to it
+- `TestTombstoneInSSTableShadowsOlderSSTable`, `TestTombstoneInL0ShadowsL1`: a delete already flushed to disk must still hide older values
+- `TestReopenRecoversSSTables`: flushed and compacted data (and tombstones) survive Close + Open
+- `TestReopenAfterInterruptedCompaction`: leftover inputs from a crashed compaction are discarded, not resurrected
+- `TestSparseIndexLookups`: every key and every gap between keys in a 500-entry table
 - `TestCompaction`: merges L0 into L1 correctly; updated keys show the new value, deleted keys are gone
 - `TestSSTableFileCountBounded`: after 20 rounds of writes and flushes, total SSTable file count stays bounded
 
@@ -201,6 +227,8 @@ printf 'GET mykey\r\n' | nc -q1 127.0.0.1 6381
 
 **Failover test:**
 
+Writes to a follower are rejected with `-ERR not leader (leader is n1)`.
+
 Kill the leader (Ctrl-C in its terminal). The other two elect a new leader in about 400ms. Try writing to them:
 
 ```bash
@@ -208,7 +236,7 @@ printf 'PUT afterfail 2\r\nok\r\n' | nc -q1 127.0.0.1 6381
 printf 'PUT afterfail 2\r\nok\r\n' | nc -q1 127.0.0.1 6382
 ```
 
-One of them will accept it. Restart the killed node and it will catch up automatically from the new leader.
+One of them will accept it. Restart the killed node and it will catch up automatically from the new leader. To exercise InstallSnapshot, start the nodes with `--snapshot-every 10` and write more than 10 keys while one node is down.
 
 ```bash
 rm -rf /tmp/kv kvengine
@@ -247,7 +275,7 @@ go test -bench=. -benchtime=3s ./internal/server/...
 go test -bench=. -benchtime=3s ./internal/lsm/...
 ```
 
-Compare `BenchmarkPutSequential` vs `BenchmarkPutParallel` vs `BenchmarkPutSameKeyParallel`. They should all be within noise of each other around 550 us. This confirms fsync is the bottleneck, not the lock.
+`BenchmarkPutSequential`, `BenchmarkPutParallel` and `BenchmarkPutSameKeyParallel` should be within noise of each other: with few writers, fsync is the bottleneck, not the lock. `BenchmarkPutConcurrentWriters` shows group commit: per-write cost should fall sharply as the writer count rises.
 
 ---
 
