@@ -44,8 +44,10 @@ type KVStore interface {
 type Server struct {
 	store KVStore
 
-	mu       sync.Mutex // guards listener: written by Serve, read by Close/Addr from other goroutines
+	mu       sync.Mutex // guards listener, conns, closed
 	listener net.Listener
+	conns    map[net.Conn]struct{}
+	closed   bool
 
 	// IdleTimeout overrides defaultIdleTimeout; exported so tests can use a
 	// short timeout instead of waiting 30s. Zero means "use the default."
@@ -80,6 +82,11 @@ func (srv *Server) ListenAndServe(addr string) error {
 // read back the actual address before connecting).
 func (srv *Server) Serve(ln net.Listener) error {
 	srv.mu.Lock()
+	if srv.closed {
+		srv.mu.Unlock()
+		ln.Close()
+		return net.ErrClosed
+	}
 	srv.listener = ln
 	srv.mu.Unlock()
 
@@ -88,8 +95,33 @@ func (srv *Server) Serve(ln net.Listener) error {
 		if err != nil {
 			return err
 		}
+		if !srv.track(conn) {
+			conn.Close()
+			return net.ErrClosed
+		}
 		go srv.handleConn(conn)
 	}
+}
+
+// track registers conn so Close can reach it. Returns false if the server
+// is already closed.
+func (srv *Server) track(conn net.Conn) bool {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if srv.closed {
+		return false
+	}
+	if srv.conns == nil {
+		srv.conns = make(map[net.Conn]struct{})
+	}
+	srv.conns[conn] = struct{}{}
+	return true
+}
+
+func (srv *Server) untrack(conn net.Conn) {
+	srv.mu.Lock()
+	delete(srv.conns, conn)
+	srv.mu.Unlock()
 }
 
 func (srv *Server) Addr() net.Addr {
@@ -102,10 +134,19 @@ func (srv *Server) Addr() net.Addr {
 	return ln.Addr()
 }
 
+// Close stops accepting connections and closes every open connection.
+// A command already being executed (e.g. a Put waiting on fsync) completes
+// against the store, but its reply may not reach the client.
 func (srv *Server) Close() error {
 	srv.mu.Lock()
+	srv.closed = true
 	ln := srv.listener
+	conns := srv.conns
+	srv.conns = nil
 	srv.mu.Unlock()
+	for c := range conns {
+		c.Close()
+	}
 	if ln != nil {
 		return ln.Close()
 	}
@@ -117,6 +158,7 @@ func (srv *Server) Close() error {
 // value-reading path below, both of which use loop/ReadFull patterns that
 // are correct regardless of how the OS/network fragments the bytes.
 func (srv *Server) handleConn(conn net.Conn) {
+	defer srv.untrack(conn)
 	defer conn.Close()
 	r := bufio.NewReader(conn)
 	w := bufio.NewWriter(conn)

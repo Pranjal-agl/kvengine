@@ -74,6 +74,20 @@ func Open(walPath string) (*Store, error) {
 	return s, nil
 }
 
+// NewMemory returns a Store with no write-ahead log: writes are applied to
+// memory only and are lost on exit. Used as the Raft state machine, where
+// the Raft log and snapshots already provide durability and a second WAL
+// would only add an fsync per write and an ever-growing file.
+func NewMemory() *Store {
+	s := &Store{
+		data:       make(map[string][]byte),
+		reqs:       make(chan *writeReq, maxBatch),
+		commitDone: make(chan struct{}),
+	}
+	go s.commitLoop()
+	return s
+}
+
 func applyRecord(data map[string][]byte, rec wal.Record) {
 	switch rec.Type {
 	case wal.RecordPut:
@@ -135,13 +149,15 @@ func (s *Store) commitLoop() {
 
 func (s *Store) commit(batch []*writeReq) {
 	var err error
-	for _, r := range batch {
-		if err = s.log.Append(r.rec); err != nil {
-			break
+	if s.log != nil {
+		for _, r := range batch {
+			if err = s.log.Append(r.rec); err != nil {
+				break
+			}
 		}
-	}
-	if err == nil {
-		err = s.log.Sync()
+		if err == nil {
+			err = s.log.Sync()
+		}
 	}
 	if err == nil {
 		s.mu.Lock()
@@ -221,9 +237,10 @@ func (s *Store) RestoreSnapshot(data []byte) error {
 	return nil
 }
 
-// WAL returns the underlying write-ahead log. Used by the replication
-// leader to stream WAL bytes to followers via wal.StreamFrom. Not for
-// general use — callers should go through Store's Put/Get/Delete API.
+// WAL returns the underlying write-ahead log (nil for NewMemory stores).
+// Used by the replication leader to stream WAL bytes to followers via
+// wal.StreamFrom. Not for general use — callers should go through Store's
+// Put/Get/Delete API.
 func (s *Store) WAL() *wal.WAL {
 	return s.log
 }
@@ -240,5 +257,8 @@ func (s *Store) Close() error {
 	close(s.reqs)
 	s.closeMu.Unlock()
 	<-s.commitDone
+	if s.log == nil {
+		return nil
+	}
 	return s.log.Close()
 }

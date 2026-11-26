@@ -16,7 +16,7 @@
 //	              --peers <id=host:raftport,id=host:raftport,...> \
 //	              --raft-addr <host:raftport> \
 //	              --kv-addr <host:kvport> \
-//	              --data-dir <dir>
+//	              --data-dir <dir> [--snapshot-every N]
 //	  e.g. (node 0 of 3):
 //	    kvengine raft --id node0 \
 //	      --peers "node1=127.0.0.1:7001,node2=127.0.0.1:7002" \
@@ -26,18 +26,21 @@
 package main
 
 import (
-	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	_ "net/http/pprof" // registers /debug/pprof handlers on DefaultServeMux
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
-	"time"
+	"syscall"
 
 	"kvengine/internal/raft"
+	"kvengine/internal/raftkv"
 	"kvengine/internal/server"
 	"kvengine/internal/store"
 )
@@ -78,17 +81,26 @@ func runSingleNode(walPath string, args []string) {
 			usage()
 			os.Exit(2)
 		}
-		// Start pprof on :6060 so you can profile a live server.
-		// Usage: go tool pprof http://localhost:6060/debug/pprof/profile?seconds=30
-		go func() {
-			log.Println("pprof listening on :6060 (go tool pprof http://localhost:6060/debug/pprof/profile)")
-			if err := http.ListenAndServe(":6060", nil); err != nil {
-				log.Printf("pprof: %v", err)
-			}
-		}()
+		// pprof for profiling a live server (scripts/flamegraph.sh uses it):
+		//   go tool pprof http://localhost:6060/debug/pprof/profile?seconds=30
+		// Bound to loopback by default — pprof exposes internals and can be
+		// used to burn CPU, so it shouldn't be reachable from the network.
+		// Override with KVENGINE_PPROF=<addr>, or disable with KVENGINE_PPROF=off.
+		if addr := pprofAddr(); addr != "" {
+			go func() {
+				log.Printf("pprof listening on %s", addr)
+				if err := http.ListenAndServe(addr, nil); err != nil {
+					log.Printf("pprof: %v", err)
+				}
+			}()
+		}
 		srv := server.New(s)
+		shutdownOnSignal(func() {
+			srv.Close()
+			s.Close() // waits for in-flight writes to commit
+		})
 		log.Printf("kvengine listening on %s (wal: %s)", rest[0], walPath)
-		if err := srv.ListenAndServe(rest[0]); err != nil {
+		if err := srv.ListenAndServe(rest[0]); err != nil && !errors.Is(err, net.ErrClosed) {
 			fatal("serve:", err)
 		}
 	case "put":
@@ -134,7 +146,8 @@ func runRaft(args []string) {
 	peersRaw := fs.String("peers", "", "comma-separated peer=addr pairs (e.g. node1=127.0.0.1:7001,node2=127.0.0.1:7002)")
 	raftAddr := fs.String("raft-addr", "", "address this node listens on for Raft RPCs (e.g. 127.0.0.1:7000)")
 	kvAddr := fs.String("kv-addr", ":6380", "address for the client KV protocol")
-	dataDir := fs.String("data-dir", ".", "directory for WAL, Raft state, and snapshots")
+	dataDir := fs.String("data-dir", ".", "directory for Raft state and snapshots")
+	snapEvery := fs.Int("snapshot-every", 1000, "take a Raft snapshot after this many applied writes (0 = never)")
 	fs.Parse(args)
 
 	if *id == "" || *raftAddr == "" {
@@ -153,157 +166,62 @@ func runRaft(args []string) {
 	if *peersRaw != "" {
 		for _, pair := range strings.Split(*peersRaw, ",") {
 			parts := strings.SplitN(strings.TrimSpace(pair), "=", 2)
-			if len(parts) != 2 {
+			if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 				fatal("bad peer spec (want id=addr):", fmt.Errorf("%q", pair))
+			}
+			if parts[0] == *id {
+				fatal("bad peer spec:", fmt.Errorf("--peers must not include this node (%s)", *id))
 			}
 			addrs[parts[0]] = parts[1]
 			peerIDs = append(peerIDs, parts[0])
 		}
 	}
 
-	// Open the KV store.
-	walPath := filepath.Join(*dataDir, "kv.wal")
-	s, err := store.Open(walPath)
-	if err != nil {
-		fatal("open store:", err)
-	}
-	defer s.Close()
-
-	// Build and start the Raft node.
+	// Build the Raft node. The Raft log and snapshots are the durable
+	// source of truth; the key-value state is rebuilt from them on start.
 	transport := raft.NewTCPTransport(addrs)
 	applyCh := make(chan raft.ApplyMsg, 256)
-	statePath := filepath.Join(*dataDir, "raft-state.json")
-	snapPath := filepath.Join(*dataDir, "raft-snap.json")
-
-	node, err := raft.NewNode(*id, peerIDs, transport, applyCh, statePath, snapPath)
+	node, err := raft.NewNode(*id, peerIDs, transport, applyCh,
+		filepath.Join(*dataDir, "raft-state.json"),
+		filepath.Join(*dataDir, "raft-snap.json"))
 	if err != nil {
 		fatal("raft node:", err)
 	}
-	defer node.Stop()
+	kv, err := raftkv.New(node, applyCh, raftkv.Options{SnapshotEvery: *snapEvery})
+	if err != nil {
+		fatal("raft kv:", err)
+	}
 
-	// Serve Raft RPCs.
 	go func() {
 		log.Printf("[%s] Raft listening on %s", *id, *raftAddr)
 		if err := transport.Serve(*id); err != nil {
 			log.Printf("[%s] Raft transport closed: %v", *id, err)
 		}
 	}()
-	defer transport.Close()
 
-	// Apply committed Raft log entries to the KV store.
-	go applyRaftToStore(node, s, applyCh, *dataDir)
-
-	// Serve the KV client protocol.
-	// Only the Raft leader should accept writes; reads from any node.
-	// For simplicity here, we wrap Store with a leader-check so writes
-	// issued to a follower return an error rather than silently failing.
-	raftStore := &raftStore{node: node, store: s}
-	srv := server.New(raftStore)
+	srv := server.New(kv)
+	shutdownOnSignal(func() {
+		srv.Close()
+		transport.Close()
+		node.Stop()
+		kv.Close()
+	})
 	log.Printf("[%s] KV server listening on %s", *id, *kvAddr)
-	if err := srv.ListenAndServe(*kvAddr); err != nil {
+	if err := srv.ListenAndServe(*kvAddr); err != nil && !errors.Is(err, net.ErrClosed) {
 		fatal("kv serve:", err)
 	}
 }
 
-// applyRaftToStore reads committed entries from applyCh and applies them
-// to the KV store. The command encoding is JSON: {"op":"put","k":"...","v":"..."}
-// or {"op":"del","k":"..."}.
-func applyRaftToStore(node *raft.Node, s *store.Store, applyCh <-chan raft.ApplyMsg, dataDir string) {
-	const snapshotEvery = 100 // take a snapshot after every N applied entries
-	applied := 0
-	for msg := range applyCh {
-		var cmd struct {
-			Op  string `json:"op"`
-			Key string `json:"k"`
-			Val string `json:"v"`
-		}
-		if err := json.Unmarshal(msg.Command, &cmd); err != nil {
-			log.Printf("raft apply: bad command at index %d: %v", msg.CommandIndex, err)
-			continue
-		}
-		switch cmd.Op {
-		case "put":
-			s.Put([]byte(cmd.Key), []byte(cmd.Val))
-		case "del":
-			s.Delete([]byte(cmd.Key))
-		}
-		applied++
-
-		// Periodic snapshot to bound log growth.
-		if applied%snapshotEvery == 0 {
-			snapData, _ := s.Snapshot()
-			if err := node.TakeSnapshot(msg.CommandIndex, snapData); err != nil {
-				log.Printf("raft snapshot failed: %v", err)
-			} else {
-				log.Printf("snapshotted at index %d", msg.CommandIndex)
-			}
-		}
-	}
-}
-
-// raftStore wraps store.Store and encodes writes as Raft log entries so
-// they go through consensus before being applied, rather than writing
-// directly to the store (which would bypass the other nodes entirely).
-type raftStore struct {
-	node  *raft.Node
-	store *store.Store
-}
-
-// The server package calls Put, Get, Delete on us; we implement the same
-// interface as store.Store for Get (reads are served locally) but route
-// Put/Delete through Raft.
-func (r *raftStore) Put(key, value []byte) error {
-	state := r.node.State()
-	if state.Role != raft.Leader {
-		return fmt.Errorf("not leader (try node %s)", state.LeaderId)
-	}
-	cmd, _ := json.Marshal(map[string]string{"op": "put", "k": string(key), "v": string(value)})
-	idx, term, ok := r.node.Propose(cmd)
-	if !ok {
-		return fmt.Errorf("not leader")
-	}
-	// Wait for this specific index to be applied (with timeout).
-	return r.waitApplied(idx, term, 5*time.Second)
-}
-
-func (r *raftStore) Delete(key []byte) error {
-	state := r.node.State()
-	if state.Role != raft.Leader {
-		return fmt.Errorf("not leader (try node %s)", state.LeaderId)
-	}
-	cmd, _ := json.Marshal(map[string]string{"op": "del", "k": string(key)})
-	idx, term, ok := r.node.Propose(cmd)
-	if !ok {
-		return fmt.Errorf("not leader")
-	}
-	return r.waitApplied(idx, term, 5*time.Second)
-}
-
-func (r *raftStore) Get(key []byte) ([]byte, bool) {
-	return r.store.Get(key)
-}
-
-func (r *raftStore) Len() int { return r.store.Len() }
-
-// waitApplied blocks until the store has applied the entry at logIndex
-// (confirming the write is durable + agreed by quorum) or times out.
-func (r *raftStore) waitApplied(logIndex uint64, term uint64, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		snap := r.node.LogSnapshot()
-		// Check if the node's log has moved past our index and the term
-		// at that position matches — confirms it wasn't overwritten.
-		if uint64(len(snap)) > logIndex {
-			if snap[logIndex].Term == term {
-				// Check commitIndex via state.
-				return nil // applied
-			}
-			return fmt.Errorf("log at index %d has term %d, not %d — leader changed",
-				logIndex, snap[logIndex].Term, term)
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	return fmt.Errorf("timed out waiting for index %d to be applied", logIndex)
+// shutdownOnSignal runs cleanup on SIGINT/SIGTERM, then exits.
+func shutdownOnSignal(cleanup func()) {
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		sig := <-sigs
+		log.Printf("received %v, shutting down", sig)
+		cleanup()
+		os.Exit(0)
+	}()
 }
 
 func usage() {
@@ -317,7 +235,7 @@ Single-node (no Raft):
 
 Raft cluster node:
   kvengine raft --id <id> --raft-addr <addr> --kv-addr <addr> \
-                --peers <id=addr,...> --data-dir <dir>
+                --peers <id=addr,...> --data-dir <dir> [--snapshot-every N]
 
   Example — 3-node cluster on localhost:
     Terminal 1: kvengine raft --id n0 --raft-addr :7000 --kv-addr :6380 \
@@ -326,6 +244,17 @@ Raft cluster node:
                   --peers "n0=:7000,n2=:7002" --data-dir /tmp/kv/n1
     Terminal 3: kvengine raft --id n2 --raft-addr :7002 --kv-addr :6382 \
                   --peers "n0=:7000,n1=:7001" --data-dir /tmp/kv/n2`)
+}
+
+func pprofAddr() string {
+	switch v := os.Getenv("KVENGINE_PPROF"); v {
+	case "":
+		return "127.0.0.1:6060"
+	case "off":
+		return ""
+	default:
+		return v
+	}
 }
 
 func fatal(msg string, err error) {

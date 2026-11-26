@@ -297,3 +297,27 @@ func TestSlowClientDoesNotBlockOthers(t *testing.T) {
 		t.Fatalf("fast client was blocked by the slow client — connection isolation is broken")
 	}
 }
+
+// TestCloseDisconnectsClients: Close must drop open connections, not just
+// stop accepting new ones, so a shutdown doesn't hang on idle clients.
+func TestCloseDisconnectsClients(t *testing.T) {
+	srv, addr := startTestServer(t)
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	fmt.Fprint(conn, "GET k\r\n")
+	r := bufio.NewReader(conn)
+	if line, _ := r.ReadString('\n'); line != "$-1\r\n" {
+		t.Fatalf("got %q", line)
+	}
+
+	srv.Close()
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := r.ReadByte(); err == nil {
+		t.Fatal("connection still open after Close")
+	} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		t.Fatal("connection still open after Close (read timed out)")
+	}
+}
