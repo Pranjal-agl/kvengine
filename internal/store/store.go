@@ -23,31 +23,43 @@ const maxBatch = 256
 
 // Store is safe for concurrent use.
 //
-// Reads take an RWMutex read lock on the map. Writes go through a single
-// committer goroutine (see commitLoop) that implements group commit: it
-// drains every write that is waiting, appends them all to the WAL, fsyncs
-// once, applies them to the map in log order, and only then wakes the
-// writers. This gives two properties at once:
+// Reads take an RWMutex read lock on the map. Writes use leader-based group
+// commit (the pattern LevelDB uses): writers join a queue; whichever writer
+// finds no commit in progress becomes the leader, takes everything queued
+// as one batch, appends it to the WAL, fsyncs once, applies it to the map
+// in log order, and wakes the batch's writers. If more writers queued up
+// meanwhile, it hands leadership to the next one in line.
 //
 //   - Throughput: N concurrent writers share one fsync instead of paying
 //     for N. fsync dominates write latency, so this is where the win is.
-//   - Correctness: the map is updated in exactly the order records appear
-//     in the WAL, so the state readers see before a crash is the state
-//     replay rebuilds after it.
+//   - Latency: an uncontended writer commits on its own goroutine with no
+//     handoff, so a single writer pays no more than before.
+//   - Correctness: only one leader runs at a time and it applies batches
+//     to the map in exactly the order they hit the WAL, so the state
+//     readers see before a crash is the state replay rebuilds after it.
 type Store struct {
 	mu   sync.RWMutex
 	data map[string][]byte
 	log  *wal.WAL
 
-	reqs       chan *writeReq
-	closeMu    sync.RWMutex // held for read while sending on reqs; for write by Close
-	closed     bool
-	commitDone chan struct{}
+	wmu        sync.Mutex  // guards queue and committing
+	queue      []*writeReq // writes waiting to be committed, in arrival order
+	committing bool        // a leader is currently committing
+
+	closeMu sync.RWMutex // read-held for the whole of each write; write-held by Close
+	closed  bool
 }
 
 type writeReq struct {
 	rec  wal.Record
-	done chan error
+	done chan writeResult
+}
+
+// writeResult is sent to a waiting writer either when its write has been
+// committed (lead=false) or when it has become the leader (lead=true).
+type writeResult struct {
+	err  error
+	lead bool
 }
 
 // Open opens (or creates) the store backed by a WAL file at walPath. On
@@ -64,14 +76,7 @@ func Open(walPath string) (*Store, error) {
 	for _, rec := range records {
 		applyRecord(data, rec)
 	}
-	s := &Store{
-		data:       data,
-		log:        log,
-		reqs:       make(chan *writeReq, maxBatch),
-		commitDone: make(chan struct{}),
-	}
-	go s.commitLoop()
-	return s, nil
+	return &Store{data: data, log: log}, nil
 }
 
 // NewMemory returns a Store with no write-ahead log: writes are applied to
@@ -79,13 +84,7 @@ func Open(walPath string) (*Store, error) {
 // the Raft log and snapshots already provide durability and a second WAL
 // would only add an fsync per write and an ever-growing file.
 func NewMemory() *Store {
-	s := &Store{
-		data:       make(map[string][]byte),
-		reqs:       make(chan *writeReq, maxBatch),
-		commitDone: make(chan struct{}),
-	}
-	go s.commitLoop()
-	return s
+	return &Store{data: make(map[string][]byte)}
 }
 
 func applyRecord(data map[string][]byte, rec wal.Record) {
@@ -114,37 +113,48 @@ func (s *Store) Delete(key []byte) error {
 }
 
 func (s *Store) write(rec wal.Record) error {
-	req := &writeReq{rec: rec, done: make(chan error, 1)}
 	s.closeMu.RLock()
+	defer s.closeMu.RUnlock()
 	if s.closed {
-		s.closeMu.RUnlock()
 		return ErrClosed
 	}
-	s.reqs <- req
-	s.closeMu.RUnlock()
-	return <-req.done
-}
 
-// commitLoop is the single writer. Each iteration commits one batch.
-func (s *Store) commitLoop() {
-	defer close(s.commitDone)
-	batch := make([]*writeReq, 0, maxBatch)
-	for first := range s.reqs {
-		batch = append(batch[:0], first)
-	drain:
-		for len(batch) < maxBatch {
-			select {
-			case r, ok := <-s.reqs:
-				if !ok {
-					break drain
-				}
-				batch = append(batch, r)
-			default:
-				break drain
-			}
+	req := &writeReq{rec: rec, done: make(chan writeResult, 1)}
+	s.wmu.Lock()
+	s.queue = append(s.queue, req)
+	if s.committing {
+		// A leader is active; it (or a successor) will commit us, or hand
+		// us leadership when our turn comes.
+		s.wmu.Unlock()
+		r := <-req.done
+		if !r.lead {
+			return r.err
 		}
-		s.commit(batch)
+		s.wmu.Lock()
+	} else {
+		s.committing = true
 	}
+
+	// We are the leader and our request is at the front of the queue.
+	n := len(s.queue)
+	if n > maxBatch {
+		n = maxBatch
+	}
+	batch := s.queue[:n:n]
+	s.queue = s.queue[n:]
+	s.wmu.Unlock()
+
+	s.commit(batch) // fills every req.done in the batch, including ours
+
+	s.wmu.Lock()
+	if len(s.queue) > 0 {
+		s.queue[0].done <- writeResult{lead: true}
+	} else {
+		s.committing = false
+		s.queue = nil // drop the backing array once idle
+	}
+	s.wmu.Unlock()
+	return (<-req.done).err
 }
 
 func (s *Store) commit(batch []*writeReq) {
@@ -170,7 +180,7 @@ func (s *Store) commit(batch []*writeReq) {
 	// is told it failed. Some of the batch may still have reached disk;
 	// as with any fsync failure, the caller cannot assume either outcome.
 	for _, r := range batch {
-		r.done <- err
+		r.done <- writeResult{err: err}
 	}
 }
 
@@ -248,15 +258,12 @@ func (s *Store) WAL() *wal.WAL {
 // Close stops accepting writes, waits for in-flight writes to commit, and
 // closes the underlying WAL. Safe to call more than once.
 func (s *Store) Close() error {
-	s.closeMu.Lock()
+	s.closeMu.Lock() // waits for every in-flight write to return
+	defer s.closeMu.Unlock()
 	if s.closed {
-		s.closeMu.Unlock()
 		return nil
 	}
 	s.closed = true
-	close(s.reqs)
-	s.closeMu.Unlock()
-	<-s.commitDone
 	if s.log == nil {
 		return nil
 	}
