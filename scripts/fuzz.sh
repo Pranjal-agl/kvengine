@@ -38,6 +38,7 @@ run_fuzzer "internal/wal"    "FuzzWALAppendReplay"
 run_fuzzer "internal/server" "FuzzServerProtocol"
 run_fuzzer "internal/raft"   "FuzzHandleRequestVote"
 run_fuzzer "internal/raft"   "FuzzHandleAppendEntries"
+run_fuzzer "internal/raft"   "FuzzInstallSnapshotThenAppend"
 
 echo "========================================"
 echo "  All fuzz targets completed"

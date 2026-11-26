@@ -15,10 +15,12 @@ import (
 type rpcType uint8
 
 const (
-	rpcRequestVote   rpcType = 1
-	rpcAppendEntries rpcType = 2
-	dialTimeout              = 3 * time.Second
-	rpcTimeout               = 5 * time.Second
+	rpcRequestVote     rpcType = 1
+	rpcAppendEntries   rpcType = 2
+	rpcInstallSnapshot rpcType = 3
+
+	dialTimeout = 3 * time.Second
+	rpcTimeout  = 5 * time.Second
 )
 
 // rpcMsg is the envelope written on the wire:
@@ -136,27 +138,37 @@ func (t *TCPTransport) handleConn(conn net.Conn) {
 		return
 	}
 
+	var reply any
 	switch env.Type {
 	case rpcRequestVote:
 		var args RequestVoteArgs
 		if err := json.Unmarshal(env.Payload, &args); err != nil {
 			return
 		}
-		reply := node.HandleRequestVote(args)
-		data, _ := json.Marshal(reply)
-		writeEnvelope(w, rpcEnvelope{Type: rpcRequestVote, Payload: data})
-		w.Flush()
-
+		reply = node.HandleRequestVote(args)
 	case rpcAppendEntries:
 		var args AppendEntriesArgs
 		if err := json.Unmarshal(env.Payload, &args); err != nil {
 			return
 		}
-		reply := node.HandleAppendEntries(args)
-		data, _ := json.Marshal(reply)
-		writeEnvelope(w, rpcEnvelope{Type: rpcAppendEntries, Payload: data})
-		w.Flush()
+		reply = node.HandleAppendEntries(args)
+	case rpcInstallSnapshot:
+		var args InstallSnapshotArgs
+		if err := json.Unmarshal(env.Payload, &args); err != nil {
+			return
+		}
+		reply = node.HandleInstallSnapshot(args)
+	default:
+		return
 	}
+	data, err := json.Marshal(reply)
+	if err != nil {
+		return
+	}
+	if err := writeEnvelope(w, rpcEnvelope{Type: env.Type, Payload: data}); err != nil {
+		return
+	}
+	w.Flush()
 }
 
 func (t *TCPTransport) dial(peer string) (net.Conn, error) {
@@ -169,56 +181,51 @@ func (t *TCPTransport) dial(peer string) (net.Conn, error) {
 	return net.DialTimeout("tcp", addr, dialTimeout)
 }
 
-func (t *TCPTransport) RequestVote(peer string, args RequestVoteArgs) (RequestVoteReply, error) {
+// call performs one request/response RPC over a fresh connection.
+func (t *TCPTransport) call(peer string, typ rpcType, args, reply any) error {
 	conn, err := t.dial(peer)
 	if err != nil {
-		return RequestVoteReply{}, err
+		return err
 	}
 	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(rpcTimeout))
-
-	data, _ := json.Marshal(args)
+	if err := conn.SetDeadline(time.Now().Add(rpcTimeout)); err != nil {
+		return err
+	}
+	data, err := json.Marshal(args)
+	if err != nil {
+		return err
+	}
 	bw := bufio.NewWriter(conn)
-	if err := writeEnvelope(bw, rpcEnvelope{Type: rpcRequestVote, Payload: data}); err != nil {
-		return RequestVoteReply{}, err
+	if err := writeEnvelope(bw, rpcEnvelope{Type: typ, Payload: data}); err != nil {
+		return err
 	}
 	if err := bw.Flush(); err != nil {
-		return RequestVoteReply{}, err
+		return err
 	}
 	env, err := readEnvelope(bufio.NewReader(conn))
 	if err != nil {
-		return RequestVoteReply{}, err
+		return err
 	}
+	if env.Type != typ {
+		return fmt.Errorf("tcp transport: reply type %d for request type %d", env.Type, typ)
+	}
+	return json.Unmarshal(env.Payload, reply)
+}
+
+func (t *TCPTransport) RequestVote(peer string, args RequestVoteArgs) (RequestVoteReply, error) {
 	var reply RequestVoteReply
-	if err := json.Unmarshal(env.Payload, &reply); err != nil {
-		return RequestVoteReply{}, err
-	}
-	return reply, nil
+	err := t.call(peer, rpcRequestVote, args, &reply)
+	return reply, err
 }
 
 func (t *TCPTransport) AppendEntries(peer string, args AppendEntriesArgs) (AppendEntriesReply, error) {
-	conn, err := t.dial(peer)
-	if err != nil {
-		return AppendEntriesReply{}, err
-	}
-	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(rpcTimeout))
-
-	data, _ := json.Marshal(args)
-	bw := bufio.NewWriter(conn)
-	if err := writeEnvelope(bw, rpcEnvelope{Type: rpcAppendEntries, Payload: data}); err != nil {
-		return AppendEntriesReply{}, err
-	}
-	if err := bw.Flush(); err != nil {
-		return AppendEntriesReply{}, err
-	}
-	env, err := readEnvelope(bufio.NewReader(conn))
-	if err != nil {
-		return AppendEntriesReply{}, err
-	}
 	var reply AppendEntriesReply
-	if err := json.Unmarshal(env.Payload, &reply); err != nil {
-		return AppendEntriesReply{}, err
-	}
-	return reply, nil
+	err := t.call(peer, rpcAppendEntries, args, &reply)
+	return reply, err
+}
+
+func (t *TCPTransport) InstallSnapshot(peer string, args InstallSnapshotArgs) (InstallSnapshotReply, error) {
+	var reply InstallSnapshotReply
+	err := t.call(peer, rpcInstallSnapshot, args, &reply)
+	return reply, err
 }

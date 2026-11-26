@@ -36,7 +36,7 @@ type SimTransport struct {
 type SimEvent struct {
 	From    string
 	To      string
-	Type    string // "RequestVote" or "AppendEntries"
+	Type    string // "RequestVote", "AppendEntries" or "InstallSnapshot"
 	Dropped bool
 }
 
@@ -149,4 +149,17 @@ func (t *SimTransport) AppendEntries(peer string, args AppendEntriesArgs) (Appen
 		return AppendEntriesReply{}, fmt.Errorf("sim: unknown peer %s", peer)
 	}
 	return node.HandleAppendEntries(args), nil
+}
+
+func (t *SimTransport) InstallSnapshot(peer string, args InstallSnapshotArgs) (InstallSnapshotReply, error) {
+	dropped := t.shouldDrop(args.LeaderId, peer)
+	t.record(args.LeaderId, peer, "InstallSnapshot", dropped)
+	if dropped {
+		return InstallSnapshotReply{}, fmt.Errorf("sim: dropped InstallSnapshot %s→%s", args.LeaderId, peer)
+	}
+	node, ok := t.getNode(peer)
+	if !ok {
+		return InstallSnapshotReply{}, fmt.Errorf("sim: unknown peer %s", peer)
+	}
+	return node.HandleInstallSnapshot(args), nil
 }
