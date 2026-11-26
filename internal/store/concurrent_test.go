@@ -58,28 +58,29 @@ func TestConcurrentStress(t *testing.T) {
 	// which is more precise about *what* the right answer should be.
 }
 
-// event records one completed write, in the order it was observed to
-// complete. Because Store serializes all writes through a single WAL mutex
-// (see internal/wal.WAL.Append/Sync), the order in which Put/Delete calls
-// *return* is a valid total order of the writes that actually happened —
-// this is exactly what we replay against a sequential reference model.
+// event records one completed write with the logical times at which it
+// was invoked and at which it returned, taken from one global atomic
+// counter. Two writes whose [start, end] intervals overlap were concurrent,
+// and a linearizable store may order them either way. (Using completion
+// order alone as "the" order is not sound: with group commit, writes that
+// share an fsync return at the same moment, in arbitrary goroutine order.)
 type event struct {
-	seq    int64
-	delete bool
-	key    string
-	value  string
+	start, end int64
+	delete     bool
+	key        string
+	value      string
 }
 
 // TestLinearizability runs many goroutines issuing random Put/Delete calls
-// against the real Store, recording each operation's completion order via a
-// global atomic sequence counter. It then replays that exact order against
-// a trivial single-threaded reference map and asserts the reference's final
-// state matches the real Store's final state for every key touched.
+// against the real Store on a tiny key space, then checks a necessary
+// condition of linearizability for every key: the final state must be the
+// effect of some write that no other write on that key strictly follows in
+// real time (i.e. no other write was invoked after it returned). Any other
+// final value means the store reordered non-overlapping writes or lost one.
 //
-// This is the property-based check for "concurrent code doesn't corrupt
-// shared state": it doesn't just check for crashes/races (TestConcurrentStress
-// does that), it checks that the *values* concurrency produces are exactly
-// what a correct sequential execution would have produced.
+// internal/linearcheck runs the full Wing-Gong check (including reads) on
+// smaller histories; this test trades completeness for a much larger,
+// higher-contention write history.
 func TestLinearizability(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "linearizability.wal")
 	s, err := Open(path)
@@ -92,7 +93,7 @@ func TestLinearizability(t *testing.T) {
 	const opsPerGoroutine = 150
 	const keySpace = 8 // deliberately tiny: maximizes contention on the same keys
 
-	var seq int64
+	var clock int64
 	var eventsMu sync.Mutex
 	var events []event
 
@@ -104,59 +105,70 @@ func TestLinearizability(t *testing.T) {
 			r := rand.New(rand.NewSource(seed + 1000))
 			for i := 0; i < opsPerGoroutine; i++ {
 				key := fmt.Sprintf("k%d", r.Intn(keySpace))
+				ev := event{key: key}
+				ev.start = atomic.AddInt64(&clock, 1)
+				var err error
 				if r.Intn(4) == 0 {
-					if err := s.Delete([]byte(key)); err != nil {
-						t.Errorf("Delete: %v", err)
-						return
-					}
-					n := atomic.AddInt64(&seq, 1)
-					eventsMu.Lock()
-					events = append(events, event{seq: n, delete: true, key: key})
-					eventsMu.Unlock()
+					ev.delete = true
+					err = s.Delete([]byte(key))
 				} else {
-					val := fmt.Sprintf("v-%d-%d", seed, i)
-					if err := s.Put([]byte(key), []byte(val)); err != nil {
-						t.Errorf("Put: %v", err)
-						return
-					}
-					n := atomic.AddInt64(&seq, 1)
-					eventsMu.Lock()
-					events = append(events, event{seq: n, key: key, value: val})
-					eventsMu.Unlock()
+					ev.value = fmt.Sprintf("v-%d-%d", seed, i)
+					err = s.Put([]byte(key), []byte(ev.value))
 				}
+				ev.end = atomic.AddInt64(&clock, 1)
+				if err != nil {
+					t.Errorf("write: %v", err)
+					return
+				}
+				eventsMu.Lock()
+				events = append(events, ev)
+				eventsMu.Unlock()
 			}
 		}(int64(g))
 	}
 	wg.Wait()
 
-	// Replay in completion order against a plain map (the reference model).
-	sort.Slice(events, func(i, j int) bool { return events[i].seq < events[j].seq })
-	reference := make(map[string]string)
+	byKey := map[string][]event{}
 	for _, e := range events {
-		if e.delete {
-			delete(reference, e.key)
-		} else {
-			reference[e.key] = e.value
-		}
+		byKey[e.key] = append(byKey[e.key], e)
 	}
-
-	for key, wantVal := range reference {
-		gotVal, ok := s.Get([]byte(key))
-		if !ok {
-			t.Errorf("key %q: reference has %q, real store has nothing", key, wantVal)
-			continue
-		}
-		if string(gotVal) != wantVal {
-			t.Errorf("key %q: reference says %q, real store says %q", key, wantVal, gotVal)
-		}
-	}
-	// And nothing in the real store that the reference doesn't also have.
 	for k := 0; k < keySpace; k++ {
 		key := fmt.Sprintf("k%d", k)
-		_, refOK := reference[key]
-		_, realOK := s.Get([]byte(key))
-		if refOK != realOK {
-			t.Errorf("key %q: presence mismatch — reference=%v real=%v", key, refOK, realOK)
+		evs := byKey[key]
+		got, present := s.Get([]byte(key))
+		if len(evs) == 0 {
+			if present {
+				t.Errorf("key %q: never written, but store has %q", key, got)
+			}
+			continue
+		}
+		var latestStart int64
+		for _, e := range evs {
+			if e.start > latestStart {
+				latestStart = e.start
+			}
+		}
+		// Candidates: writes not strictly followed by another write, i.e.
+		// those still in flight when the last write on this key began.
+		ok := false
+		var candidates []string
+		for _, e := range evs {
+			if e.end < latestStart {
+				continue
+			}
+			desc := e.value
+			if e.delete {
+				desc = "<deleted>"
+			}
+			candidates = append(candidates, desc)
+			if e.delete && !present || !e.delete && present && string(got) == e.value {
+				ok = true
+			}
+		}
+		if !ok {
+			sort.Strings(candidates)
+			t.Errorf("key %q: final state (%q, present=%v) is not the effect of any final write; candidates %v",
+				key, got, present, candidates)
 		}
 	}
 }

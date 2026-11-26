@@ -3,6 +3,8 @@ package store
 import (
 	"fmt"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -87,10 +89,9 @@ func BenchmarkPutParallel(b *testing.B) {
 	defer s.Close()
 
 	b.ResetTimer()
-	var counter int
+	var counter int64
 	b.RunParallel(func(pb *testing.PB) {
-		counter++
-		localCounter := counter
+		localCounter := atomic.AddInt64(&counter, 1)
 		i := 0
 		for pb.Next() {
 			key := []byte(fmt.Sprintf("key-%d-%d", localCounter, i))
@@ -121,4 +122,41 @@ func BenchmarkPutSameKeyParallel(b *testing.B) {
 			}
 		}
 	})
+}
+
+// BenchmarkPutConcurrentWriters measures per-write cost as the number of
+// concurrent writers grows. With group commit, writers that arrive while an
+// fsync is in flight share the next one, so ns/op should fall roughly in
+// proportion to the writer count until the batch limit or CPU saturates.
+// Without it, every writer pays for its own fsync and ns/op stays flat.
+func BenchmarkPutConcurrentWriters(b *testing.B) {
+	for _, writers := range []int{1, 8, 64} {
+		b.Run(fmt.Sprintf("writers=%d", writers), func(b *testing.B) {
+			s, err := Open(filepath.Join(b.TempDir(), "bench.wal"))
+			if err != nil {
+				b.Fatalf("Open: %v", err)
+			}
+			defer s.Close()
+			var next int64
+			b.ResetTimer()
+			var wg sync.WaitGroup
+			for w := 0; w < writers; w++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for {
+						i := atomic.AddInt64(&next, 1)
+						if i > int64(b.N) {
+							return
+						}
+						if err := s.Put([]byte(fmt.Sprintf("key-%d", i)), []byte("v")); err != nil {
+							b.Errorf("Put: %v", err)
+							return
+						}
+					}
+				}()
+			}
+			wg.Wait()
+		})
+	}
 }
