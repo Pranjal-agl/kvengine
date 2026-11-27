@@ -18,6 +18,7 @@ const (
 	rpcRequestVote     rpcType = 1
 	rpcAppendEntries   rpcType = 2
 	rpcInstallSnapshot rpcType = 3
+	rpcReadIndex       rpcType = 4
 
 	dialTimeout = 3 * time.Second
 	rpcTimeout  = 5 * time.Second
@@ -158,6 +159,12 @@ func (t *TCPTransport) handleConn(conn net.Conn) {
 			return
 		}
 		reply = node.HandleInstallSnapshot(args)
+	case rpcReadIndex:
+		var args ReadIndexArgs
+		if err := json.Unmarshal(env.Payload, &args); err != nil {
+			return
+		}
+		reply = node.HandleReadIndex(args)
 	default:
 		return
 	}
@@ -227,5 +234,11 @@ func (t *TCPTransport) AppendEntries(peer string, args AppendEntriesArgs) (Appen
 func (t *TCPTransport) InstallSnapshot(peer string, args InstallSnapshotArgs) (InstallSnapshotReply, error) {
 	var reply InstallSnapshotReply
 	err := t.call(peer, rpcInstallSnapshot, args, &reply)
+	return reply, err
+}
+
+func (t *TCPTransport) ReadIndex(peer string, args ReadIndexArgs) (ReadIndexReply, error) {
+	var reply ReadIndexReply
+	err := t.call(peer, rpcReadIndex, args, &reply)
 	return reply, err
 }

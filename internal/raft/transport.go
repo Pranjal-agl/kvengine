@@ -12,6 +12,7 @@ type Transport interface {
 	RequestVote(peer string, args RequestVoteArgs) (RequestVoteReply, error)
 	AppendEntries(peer string, args AppendEntriesArgs) (AppendEntriesReply, error)
 	InstallSnapshot(peer string, args InstallSnapshotArgs) (InstallSnapshotReply, error)
+	ReadIndex(peer string, args ReadIndexArgs) (ReadIndexReply, error)
 	Register(id string, node *Node)
 }
 
@@ -115,4 +116,15 @@ func (t *MemTransport) InstallSnapshot(peer string, args InstallSnapshotArgs) (I
 		return InstallSnapshotReply{}, fmt.Errorf("unknown peer %s", peer)
 	}
 	return node.HandleInstallSnapshot(args), nil
+}
+
+func (t *MemTransport) ReadIndex(peer string, args ReadIndexArgs) (ReadIndexReply, error) {
+	if t.isPartitioned(args.From, peer) {
+		return ReadIndexReply{}, fmt.Errorf("partitioned: %s cannot reach %s", args.From, peer)
+	}
+	node, ok := t.getNode(peer)
+	if !ok {
+		return ReadIndexReply{}, fmt.Errorf("unknown peer %s", peer)
+	}
+	return node.HandleReadIndex(args), nil
 }

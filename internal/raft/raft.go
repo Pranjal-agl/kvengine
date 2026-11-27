@@ -6,8 +6,8 @@
 //
 // Implemented: leader election, log replication with fast backup,
 // persistence of currentTerm/votedFor/log (persist.go), log compaction via
-// snapshots (snapshot.go) and InstallSnapshot for followers that fall behind
-// the compaction point.
+// snapshots (snapshot.go), InstallSnapshot for followers that fall behind
+// the compaction point, and ReadIndex for linearizable reads (readindex.go).
 //
 // Indexing: Raft indices are absolute and never reset. After compaction,
 // n.log holds only the suffix starting at snapshotIndex — n.log[0] is a
@@ -16,8 +16,8 @@
 // (lastIndex, termAt, entryAt, sliceFrom) which translate absolute indices to
 // slice positions. Never index n.log directly with a Raft index.
 //
-// Known limitations: no cluster membership changes, no linearizable reads
-// (ReadIndex / leases), no pre-vote.
+// Known limitations: no cluster membership changes, no leader leases, no
+// pre-vote.
 package raft
 
 import (
@@ -100,6 +100,18 @@ type AppendEntriesArgs struct {
 	Entries      []LogEntry
 	LeaderCommit uint64
 }
+
+// ReadIndexArgs asks the leader for a read index on behalf of a follower
+// serving a linearizable read (Raft thesis §6.4).
+type ReadIndexArgs struct {
+	From string
+}
+type ReadIndexReply struct {
+	Index    uint64 // commit index the follower must apply before reading
+	OK       bool   // false: the receiver could not confirm it is the leader
+	LeaderId string // receiver's view of the leader, as a redirect hint when !OK
+}
+
 type InstallSnapshotArgs struct {
 	Term              uint64
 	LeaderId          string
@@ -160,6 +172,18 @@ type Node struct {
 	matchIndex       map[string]uint64
 	snapshotInFlight map[string]bool
 
+	// ReadIndex support. Every AppendEntries/InstallSnapshot carries the
+	// value of hbRound when it was built; ackRound[peer] is the highest
+	// such round the peer has answered as a follower of our term. A read
+	// that bumps hbRound to r and then sees a majority with ackRound >= r
+	// knows we were still leader after the read arrived.
+	hbRound  uint64
+	ackRound map[string]uint64
+
+	// changed is closed (and replaced) whenever role, commitIndex or
+	// ackRound changes, waking goroutines blocked in ReadIndex.
+	changed chan struct{}
+
 	// Infrastructure
 	transport    Transport
 	applyCh      chan ApplyMsg
@@ -192,6 +216,7 @@ func NewNode(id string, peers []string, transport Transport, applyCh chan ApplyM
 		role:         Follower,
 		commitNotify: make(chan struct{}, 1),
 		stopCh:       make(chan struct{}),
+		changed:      make(chan struct{}),
 	}
 	snap, err := n.LatestSnapshot()
 	if err != nil {
@@ -365,6 +390,9 @@ func (n *Node) startElection() {
 // voted for) would let this node grant a second vote in the same term to a
 // late RequestVote from another candidate — two leaders in one term.
 func (n *Node) becomeFollower(term uint64) {
+	if n.role != Follower || term > n.currentTerm {
+		n.signal() // wake ReadIndex waiters: leadership lost
+	}
 	n.role = Follower
 	if term > n.currentTerm {
 		n.currentTerm = term
@@ -382,6 +410,8 @@ func (n *Node) becomeLeader() {
 	n.nextIndex = make(map[string]uint64, len(n.peers))
 	n.matchIndex = make(map[string]uint64, len(n.peers))
 	n.snapshotInFlight = make(map[string]bool, len(n.peers))
+	n.ackRound = make(map[string]uint64, len(n.peers))
+	n.signal()
 	for _, peer := range n.peers {
 		n.nextIndex[peer] = lastIdx + 1
 		n.matchIndex[peer] = 0
@@ -458,6 +488,7 @@ func (n *Node) sendAppendEntries(peer string) {
 		LeaderCommit: n.commitIndex,
 	}
 	term := n.currentTerm
+	round := n.hbRound
 
 	go func() {
 		reply, err := n.transport.AppendEntries(peer, args)
@@ -478,6 +509,8 @@ func (n *Node) sendAppendEntries(peer string) {
 		if n.role != Leader || n.currentTerm != term {
 			return // stale reply
 		}
+		// Success or not, the peer accepted us as leader for this term.
+		n.recordAck(peer, round)
 
 		if reply.Success {
 			newMatch := args.PrevLogIndex + uint64(len(args.Entries))
@@ -538,6 +571,7 @@ func (n *Node) sendInstallSnapshot(peer string) {
 		Data:              n.snapshotData,
 	}
 	term := n.currentTerm
+	round := n.hbRound
 
 	go func() {
 		reply, err := n.transport.InstallSnapshot(peer, args)
@@ -560,6 +594,7 @@ func (n *Node) sendInstallSnapshot(peer string) {
 		if n.role != Leader || n.currentTerm != term {
 			return
 		}
+		n.recordAck(peer, round)
 		if args.LastIncludedIndex > n.matchIndex[peer] {
 			n.matchIndex[peer] = args.LastIncludedIndex
 		}
@@ -602,10 +637,26 @@ func (n *Node) maybeAdvanceCommitIndex() {
 	}
 }
 
+// notifyApply is called whenever commitIndex advances (or a snapshot is
+// installed): it wakes applyLoop and any ReadIndex waiters.
 func (n *Node) notifyApply() {
 	select {
 	case n.commitNotify <- struct{}{}:
 	default:
+	}
+	n.signal()
+}
+
+// signal wakes every goroutine waiting on n.changed. Called with mu held.
+func (n *Node) signal() {
+	close(n.changed)
+	n.changed = make(chan struct{})
+}
+
+func (n *Node) recordAck(peer string, round uint64) {
+	if round > n.ackRound[peer] {
+		n.ackRound[peer] = round
+		n.signal()
 	}
 }
 
