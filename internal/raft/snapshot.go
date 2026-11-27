@@ -64,7 +64,7 @@ func (n *Node) TakeSnapshot(upToIndex uint64, stateMachineData []byte) error {
 	n.snapshotIndex = upToIndex
 	n.snapshotTerm = lastTerm
 	n.snapshotData = stateMachineData
-	n.persist()
+	n.rewriteLog()
 	return nil
 }
 

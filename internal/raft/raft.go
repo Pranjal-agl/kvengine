@@ -25,6 +25,8 @@ import (
 	"math/rand"
 	"sync"
 	"time"
+
+	"kvengine/internal/wal"
 )
 
 const (
@@ -198,6 +200,16 @@ type Node struct {
 	commitNotify chan struct{}
 	stopOnce     sync.Once // ensures Stop() is idempotent
 	stopCh       chan struct{}
+
+	logw *wal.WAL // append-only log file (nil when statePath is "")
+
+	// durableIndex is the last log index known to be fsynced. Followers
+	// persist before replying, so for them it tracks lastIndex. A leader
+	// appends proposals to memory, replicates them immediately, and lets
+	// persistLoop fsync whatever has accumulated in one batch (Raft thesis
+	// §10.2.1); it counts itself toward a majority only up to durableIndex.
+	durableIndex  uint64
+	persistNotify chan struct{}
 }
 
 // NewNode creates a Raft node. statePath and snapshotPath may be "" to
@@ -214,17 +226,18 @@ func NewNode(id string, peers []string, transport Transport, applyCh chan ApplyM
 		sp = snapshotPath[0]
 	}
 	n := &Node{
-		id:           id,
-		peers:        peers,
-		statePath:    statePath,
-		snapshotPath: sp,
-		transport:    transport,
-		applyCh:      applyCh,
-		log:          []LogEntry{{Term: 0}},
-		role:         Follower,
-		commitNotify: make(chan struct{}, 1),
-		stopCh:       make(chan struct{}),
-		changed:      make(chan struct{}),
+		id:            id,
+		peers:         peers,
+		statePath:     statePath,
+		snapshotPath:  sp,
+		transport:     transport,
+		applyCh:       applyCh,
+		log:           []LogEntry{{Term: 0}},
+		role:          Follower,
+		commitNotify:  make(chan struct{}, 1),
+		persistNotify: make(chan struct{}, 1),
+		stopCh:        make(chan struct{}),
+		changed:       make(chan struct{}),
 	}
 	snap, err := n.LatestSnapshot()
 	if err != nil {
@@ -245,6 +258,7 @@ func NewNode(id string, peers []string, transport Transport, applyCh chan ApplyM
 	go n.electionLoop()
 	go n.heartbeatLoop()
 	go n.applyLoop()
+	go n.persistLoop()
 	return n, nil
 }
 
@@ -255,6 +269,9 @@ func (n *Node) Stop() {
 	n.stopOnce.Do(func() {
 		n.mu.Lock()
 		close(n.stopCh)
+		if n.logw != nil {
+			n.logw.Close()
+		}
 		n.mu.Unlock()
 	})
 }
@@ -342,7 +359,7 @@ func (n *Node) startElection() {
 	n.votedFor = n.id
 	n.leaderId = ""
 	n.lastHeartbeat = time.Now() // prevent back-to-back elections
-	n.persist()                  // must persist before sending RequestVote RPCs
+	n.persistMeta()              // must persist before sending RequestVote RPCs
 
 	term := n.currentTerm
 	lastIdx, lastTerm := n.lastLogIndexAndTerm()
@@ -406,7 +423,7 @@ func (n *Node) becomeFollower(term uint64) {
 		n.currentTerm = term
 		n.votedFor = ""
 		n.leaderId = ""
-		n.persist() // must persist before any reply
+		n.persistMeta() // must persist before any reply
 	}
 }
 
@@ -432,7 +449,7 @@ func (n *Node) becomeLeader() {
 	// (and unapplied) until the next client write. No-ops have a nil
 	// Command and are not delivered on applyCh.
 	n.log = append(n.log, LogEntry{Term: n.currentTerm})
-	n.persist()
+	n.persistEntries(n.lastIndex())
 	// Immediate heartbeat asserts leadership and prevents a new election.
 	n.broadcastAppendEntries()
 	n.maybeAdvanceCommitIndex() // single-node cluster commits immediately
@@ -632,7 +649,10 @@ func (n *Node) maybeAdvanceCommitIndex() {
 		if n.termAt(idx) != n.currentTerm {
 			continue
 		}
-		count := 1 // self
+		count := 0
+		if n.selfDurable(idx) {
+			count = 1
+		}
 		for _, peer := range n.peers {
 			if n.matchIndex[peer] >= idx {
 				count++
@@ -697,7 +717,7 @@ func (n *Node) HandleRequestVote(args RequestVoteArgs) RequestVoteReply {
 	if logOK && canVote {
 		if n.votedFor != args.CandidateId {
 			n.votedFor = args.CandidateId
-			n.persist() // must persist votedFor before granting vote
+			n.persistMeta() // must persist votedFor before granting vote
 		}
 		n.lastHeartbeat = time.Now() // reset election timer on granting a vote
 		return RequestVoteReply{Term: n.currentTerm, VoteGranted: true}
@@ -763,6 +783,7 @@ func (n *Node) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 	// already have with matching terms are skipped, so a retried or
 	// reordered RPC never truncates entries that a newer RPC appended.
 	changed := false
+	var firstChanged uint64
 	for i, entry := range entries {
 		idx := prevIdx + uint64(i) + 1
 		if idx <= n.lastIndex() {
@@ -772,11 +793,11 @@ func (n *Node) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 			n.truncateAfter(idx - 1) // truncate divergent suffix
 		}
 		n.log = append(n.log, entries[i:]...)
-		changed = true
+		changed, firstChanged = true, idx
 		break
 	}
 	if changed {
-		n.persist() // must persist log changes before replying success
+		n.persistEntries(firstChanged) // must persist log changes before replying success
 	}
 
 	// Advance commitIndex to match the leader, bounded by the last entry
@@ -841,7 +862,7 @@ func (n *Node) HandleInstallSnapshot(args InstallSnapshotArgs) InstallSnapshotRe
 	n.snapshotIndex = args.LastIncludedIndex
 	n.snapshotTerm = args.LastIncludedTerm
 	n.snapshotData = args.Data
-	n.persist()
+	n.rewriteLog()
 
 	n.commitIndex = args.LastIncludedIndex
 	n.lastApplied = args.LastIncludedIndex
@@ -874,10 +895,45 @@ func (n *Node) Propose(command []byte) (uint64, uint64, bool) {
 	}
 	n.log = append(n.log, LogEntry{Term: n.currentTerm, Command: command})
 	idx := n.lastIndex()
-	n.persist() // persist before broadcasting
+	// Replicate now and fsync locally in the background: persistLoop
+	// batches every proposal that arrives meanwhile into one fsync. Safe
+	// because the leader doesn't count itself toward a majority for an
+	// entry until it is durable (maybeAdvanceCommitIndex).
+	select {
+	case n.persistNotify <- struct{}{}:
+	default:
+	}
 	n.broadcastAppendEntries()
-	n.maybeAdvanceCommitIndex() // commits immediately in a single-node cluster
+	n.maybeAdvanceCommitIndex() // in-memory single-node clusters commit immediately
 	return idx, n.currentTerm, true
+}
+
+// persistLoop fsyncs log entries the leader has appended but not yet made
+// durable, then re-checks the commit index. Holding mu during the write
+// keeps file order identical to log order (a step-down can't interleave a
+// truncation), and lets every Propose that queues on mu meanwhile land in
+// the next batch.
+func (n *Node) persistLoop() {
+	for {
+		select {
+		case <-n.stopCh:
+			return
+		case <-n.persistNotify:
+		}
+		n.mu.Lock()
+		if !n.stopped() && n.durableIndex < n.lastIndex() {
+			n.persistEntries(n.durableIndex + 1)
+			if n.role == Leader {
+				n.maybeAdvanceCommitIndex()
+			}
+		}
+		n.mu.Unlock()
+	}
+}
+
+// selfDurable reports whether this node may count itself as storing idx.
+func (n *Node) selfDurable(idx uint64) bool {
+	return n.statePath == "" || n.durableIndex >= idx
 }
 
 // --- Apply loop ---
