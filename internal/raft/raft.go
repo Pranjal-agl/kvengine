@@ -180,6 +180,14 @@ type Node struct {
 	hbRound  uint64
 	ackRound map[string]uint64
 
+	// Read batching: at most one read-confirmation round is in flight.
+	// Reads arriving meanwhile are assigned the next round, which starts
+	// as soon as the in-flight one reaches a quorum, so N concurrent reads
+	// cost about one round trip, not N broadcasts.
+	readRound   uint64 // round currently in flight for reads (0 = none)
+	readRoundOn bool
+	readsQueued bool // some read is waiting for round readRound+1
+
 	// changed is closed (and replaced) whenever role, commitIndex or
 	// ackRound changes, waking goroutines blocked in ReadIndex.
 	changed chan struct{}
@@ -411,6 +419,7 @@ func (n *Node) becomeLeader() {
 	n.matchIndex = make(map[string]uint64, len(n.peers))
 	n.snapshotInFlight = make(map[string]bool, len(n.peers))
 	n.ackRound = make(map[string]uint64, len(n.peers))
+	n.readRoundOn, n.readsQueued = false, false
 	n.signal()
 	for _, peer := range n.peers {
 		n.nextIndex[peer] = lastIdx + 1
@@ -656,6 +665,7 @@ func (n *Node) signal() {
 func (n *Node) recordAck(peer string, round uint64) {
 	if round > n.ackRound[peer] {
 		n.ackRound[peer] = round
+		n.advanceReadRound()
 		n.signal()
 	}
 }

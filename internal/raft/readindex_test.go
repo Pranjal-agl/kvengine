@@ -143,3 +143,47 @@ func TestReadIndexSkipsNoOps(t *testing.T) {
 		t.Fatalf("read index = %d, want %d (last real command, skipping the new no-op)", idx, last)
 	}
 }
+
+// TestConcurrentReadsShareRounds: reads that arrive while a confirmation
+// round is in flight must share the next round, not each broadcast their
+// own. Hold the round open with a brief partition (shorter than an
+// election timeout), fire many reads, heal, and count rounds.
+func TestConcurrentReadsShareRounds(t *testing.T) {
+	c := newCluster(t, 3)
+	l := c.assertOneLeader(t)
+	c.propose(t, l, []byte("w"))
+	c.waitApplied(t, l, 1, 3*time.Second)
+	leader := c.nodes[l]
+
+	for i := range c.nodes {
+		if i != l {
+			c.transport.Partition(leader.id, c.nodes[i].id)
+		}
+	}
+	leader.mu.Lock()
+	before := leader.hbRound
+	leader.mu.Unlock()
+
+	const reads = 20
+	errs := make(chan error, reads)
+	for i := 0; i < reads; i++ {
+		go func() {
+			_, err := leader.ReadIndex(2 * time.Second)
+			errs <- err
+		}()
+	}
+	time.Sleep(80 * time.Millisecond) // all reads arrive while round 1 is stuck
+	c.transport.HealAll()
+	for i := 0; i < reads; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("read %d: %v", i, err)
+		}
+	}
+	leader.mu.Lock()
+	rounds := leader.hbRound - before
+	leader.mu.Unlock()
+	if rounds > 3 {
+		t.Fatalf("%d reads used %d rounds; want them batched into ~2", reads, rounds)
+	}
+	t.Logf("%d concurrent reads used %d confirmation rounds", reads, rounds)
+}

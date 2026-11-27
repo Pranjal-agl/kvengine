@@ -120,15 +120,49 @@ func (n *Node) leaderReadIndex(deadline time.Time) (uint64, error) {
 		readIdx--
 	}
 
-	n.hbRound++
-	round := n.hbRound
-	n.broadcastAppendEntries()
+	round := n.joinReadRound()
 	for !n.quorumAcked(round) {
 		if err := n.waitChange(deadline, term); err != nil {
 			return 0, err
 		}
 	}
 	return readIdx, nil
+}
+
+// joinReadRound returns the heartbeat round this read must see a quorum
+// for. The round must start after the read arrived: if none is in flight,
+// start one now; otherwise wait for the next one, which advanceReadRound
+// starts as soon as the in-flight round completes. Called with mu held.
+func (n *Node) joinReadRound() uint64 {
+	if !n.readRoundOn {
+		n.startReadRound()
+		return n.readRound
+	}
+	n.readsQueued = true
+	return n.readRound + 1
+}
+
+func (n *Node) startReadRound() {
+	n.hbRound++
+	n.readRound = n.hbRound
+	n.readRoundOn = true
+	n.readsQueued = false
+	n.broadcastAppendEntries()
+	if n.quorumAcked(n.readRound) { // single-node cluster
+		n.readRoundOn = false
+	}
+}
+
+// advanceReadRound runs after every ack: once the in-flight read round has
+// a quorum, start the next one if reads are queued for it. Called with mu
+// held.
+func (n *Node) advanceReadRound() {
+	if n.readRoundOn && n.quorumAcked(n.readRound) {
+		n.readRoundOn = false
+		if n.readsQueued {
+			n.startReadRound()
+		}
+	}
 }
 
 func (n *Node) quorumAcked(round uint64) bool {
