@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -62,25 +63,54 @@ func readEnvelope(r io.Reader) (rpcEnvelope, error) {
 }
 
 // TCPTransport implements Transport over real TCP connections.
-// Each RPC opens a connection to the peer, sends the request, reads the
-// reply, and closes — simple and correct. A persistent-connection pool
-// would improve throughput but is not needed here; the bottleneck is
-// fsync latency, not connection setup.
 //
-// The server side (Serve) accepts incoming connections and dispatches
-// them to the local node's handlers.
+// Connections are persistent: each carries one request/response at a time,
+// and an idle pool of up to maxIdlePerPeer connections per peer is kept for
+// reuse. Concurrent RPCs to one peer use separate connections, so a slow
+// InstallSnapshot never delays a heartbeat. Dialing per RPC used to cost a
+// TCP handshake (plus a TIME_WAIT socket) on every heartbeat.
+//
+// All Raft RPCs are idempotent, so if a pooled connection turns out to be
+// dead (the peer restarted, or closed it as idle), the call is retried once
+// on a freshly dialed connection.
+//
+// The server side (Serve) accepts connections and answers requests on each
+// until the client closes it, it sits idle for serverIdleTimeout, or the
+// transport is closed.
 type TCPTransport struct {
 	mu       sync.RWMutex
 	node     *Node             // set by Register
 	addrs    map[string]string // peer id → "host:port"
 	listener net.Listener
+	closed   bool
+
+	poolMu sync.Mutex
+	idle   map[string][]*clientConn // peer → idle outbound conns
+	active map[net.Conn]struct{}    // inbound conns, closed by Close
+
+	accepted atomic.Int64 // inbound connections accepted (for tests/metrics)
+}
+
+const (
+	maxIdlePerPeer    = 4
+	serverIdleTimeout = 2 * time.Minute
+)
+
+type clientConn struct {
+	net.Conn
+	r *bufio.Reader
+	w *bufio.Writer
 }
 
 // NewTCPTransport creates a transport. addrs maps each peer's id to its
 // listen address (e.g. {"node1": "127.0.0.1:7001", "node2": "127.0.0.1:7002"}).
 // The local node's own address is included so it can bind the listener.
 func NewTCPTransport(addrs map[string]string) *TCPTransport {
-	return &TCPTransport{addrs: addrs}
+	return &TCPTransport{
+		addrs:  addrs,
+		idle:   make(map[string][]*clientConn),
+		active: make(map[net.Conn]struct{}),
+	}
 }
 
 func (t *TCPTransport) Register(id string, node *Node) {
@@ -101,6 +131,11 @@ func (t *TCPTransport) Serve(id string) error {
 		return fmt.Errorf("tcp transport: listen %s: %w", addr, err)
 	}
 	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		ln.Close()
+		return net.ErrClosed
+	}
 	t.listener = ln
 	t.mu.Unlock()
 
@@ -109,114 +144,214 @@ func (t *TCPTransport) Serve(id string) error {
 		if err != nil {
 			return err
 		}
+		t.poolMu.Lock()
+		if t.isClosed() {
+			t.poolMu.Unlock()
+			conn.Close()
+			return net.ErrClosed
+		}
+		t.active[conn] = struct{}{}
+		t.poolMu.Unlock()
+		t.accepted.Add(1)
 		go t.handleConn(conn)
 	}
 }
 
-func (t *TCPTransport) Close() error {
+func (t *TCPTransport) isClosed() bool {
 	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.closed
+}
+
+// Close stops serving, closes every inbound and pooled outbound
+// connection, and makes further RPCs fail.
+func (t *TCPTransport) Close() error {
+	t.mu.Lock()
+	t.closed = true
 	ln := t.listener
-	t.mu.RUnlock()
+	t.mu.Unlock()
+
+	t.poolMu.Lock()
+	for c := range t.active {
+		c.Close()
+	}
+	t.active = make(map[net.Conn]struct{})
+	for peer, conns := range t.idle {
+		for _, c := range conns {
+			c.Close()
+		}
+		delete(t.idle, peer)
+	}
+	t.poolMu.Unlock()
+
 	if ln != nil {
 		return ln.Close()
 	}
 	return nil
 }
 
+// handleConn answers requests on one inbound connection, one at a time.
 func (t *TCPTransport) handleConn(conn net.Conn) {
-	defer conn.Close()
+	defer func() {
+		conn.Close()
+		t.poolMu.Lock()
+		delete(t.active, conn)
+		t.poolMu.Unlock()
+	}()
 	r := bufio.NewReader(conn)
 	w := bufio.NewWriter(conn)
-
-	env, err := readEnvelope(r)
-	if err != nil {
-		return
+	for {
+		if err := conn.SetReadDeadline(time.Now().Add(serverIdleTimeout)); err != nil {
+			return
+		}
+		env, err := readEnvelope(r)
+		if err != nil {
+			return
+		}
+		t.mu.RLock()
+		node := t.node
+		t.mu.RUnlock()
+		if node == nil {
+			return
+		}
+		reply, ok := dispatch(node, env)
+		if !ok {
+			return
+		}
+		data, err := json.Marshal(reply)
+		if err != nil {
+			return
+		}
+		if err := conn.SetWriteDeadline(time.Now().Add(rpcTimeout)); err != nil {
+			return
+		}
+		if err := writeEnvelope(w, rpcEnvelope{Type: env.Type, Payload: data}); err != nil {
+			return
+		}
+		if err := w.Flush(); err != nil {
+			return
+		}
 	}
-	t.mu.RLock()
-	node := t.node
-	t.mu.RUnlock()
-	if node == nil {
-		return
-	}
+}
 
-	var reply any
+// dispatch decodes one request and runs the matching handler. ok is false
+// for an unknown type or undecodable payload; the connection is then
+// closed, since the stream can no longer be trusted.
+func dispatch(node *Node, env rpcEnvelope) (reply any, ok bool) {
 	switch env.Type {
 	case rpcRequestVote:
 		var args RequestVoteArgs
 		if err := json.Unmarshal(env.Payload, &args); err != nil {
-			return
+			return nil, false
 		}
-		reply = node.HandleRequestVote(args)
+		return node.HandleRequestVote(args), true
 	case rpcAppendEntries:
 		var args AppendEntriesArgs
 		if err := json.Unmarshal(env.Payload, &args); err != nil {
-			return
+			return nil, false
 		}
-		reply = node.HandleAppendEntries(args)
+		return node.HandleAppendEntries(args), true
 	case rpcInstallSnapshot:
 		var args InstallSnapshotArgs
 		if err := json.Unmarshal(env.Payload, &args); err != nil {
-			return
+			return nil, false
 		}
-		reply = node.HandleInstallSnapshot(args)
+		return node.HandleInstallSnapshot(args), true
 	case rpcReadIndex:
 		var args ReadIndexArgs
 		if err := json.Unmarshal(env.Payload, &args); err != nil {
-			return
+			return nil, false
 		}
-		reply = node.HandleReadIndex(args)
-	default:
-		return
+		return node.HandleReadIndex(args), true
 	}
-	data, err := json.Marshal(reply)
-	if err != nil {
-		return
-	}
-	if err := writeEnvelope(w, rpcEnvelope{Type: env.Type, Payload: data}); err != nil {
-		return
-	}
-	w.Flush()
+	return nil, false
 }
 
-func (t *TCPTransport) dial(peer string) (net.Conn, error) {
+func (t *TCPTransport) dial(peer string) (*clientConn, error) {
 	t.mu.RLock()
 	addr, ok := t.addrs[peer]
 	t.mu.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("tcp transport: unknown peer %s", peer)
 	}
-	return net.DialTimeout("tcp", addr, dialTimeout)
+	conn, err := net.DialTimeout("tcp", addr, dialTimeout)
+	if err != nil {
+		return nil, err
+	}
+	return &clientConn{Conn: conn, r: bufio.NewReader(conn), w: bufio.NewWriter(conn)}, nil
 }
 
-// call performs one request/response RPC over a fresh connection.
+// getConn returns a pooled connection to peer if one is idle (reused=true),
+// or dials a new one.
+func (t *TCPTransport) getConn(peer string) (c *clientConn, reused bool, err error) {
+	if t.isClosed() {
+		return nil, false, net.ErrClosed
+	}
+	t.poolMu.Lock()
+	if conns := t.idle[peer]; len(conns) > 0 {
+		c = conns[len(conns)-1]
+		t.idle[peer] = conns[:len(conns)-1]
+		t.poolMu.Unlock()
+		return c, true, nil
+	}
+	t.poolMu.Unlock()
+	c, err = t.dial(peer)
+	return c, false, err
+}
+
+func (t *TCPTransport) putConn(peer string, c *clientConn) {
+	t.poolMu.Lock()
+	defer t.poolMu.Unlock()
+	if t.isClosed() || len(t.idle[peer]) >= maxIdlePerPeer {
+		c.Close()
+		return
+	}
+	t.idle[peer] = append(t.idle[peer], c)
+}
+
+// call performs one request/response RPC, reusing a pooled connection
+// when possible.
 func (t *TCPTransport) call(peer string, typ rpcType, args, reply any) error {
-	conn, err := t.dial(peer)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	if err := conn.SetDeadline(time.Now().Add(rpcTimeout)); err != nil {
-		return err
-	}
 	data, err := json.Marshal(args)
 	if err != nil {
 		return err
 	}
-	bw := bufio.NewWriter(conn)
-	if err := writeEnvelope(bw, rpcEnvelope{Type: typ, Payload: data}); err != nil {
-		return err
-	}
-	if err := bw.Flush(); err != nil {
-		return err
-	}
-	env, err := readEnvelope(bufio.NewReader(conn))
+	c, reused, err := t.getConn(peer)
 	if err != nil {
 		return err
 	}
+	env, err := roundTrip(c, typ, data)
+	if err != nil && reused {
+		// The pooled connection may have gone stale. Raft RPCs are
+		// idempotent, so retrying on a fresh connection is safe.
+		c.Close()
+		if c, err = t.dial(peer); err != nil {
+			return err
+		}
+		env, err = roundTrip(c, typ, data)
+	}
+	if err != nil {
+		c.Close()
+		return err
+	}
+	t.putConn(peer, c)
 	if env.Type != typ {
 		return fmt.Errorf("tcp transport: reply type %d for request type %d", env.Type, typ)
 	}
 	return json.Unmarshal(env.Payload, reply)
+}
+
+func roundTrip(c *clientConn, typ rpcType, payload []byte) (rpcEnvelope, error) {
+	if err := c.SetDeadline(time.Now().Add(rpcTimeout)); err != nil {
+		return rpcEnvelope{}, err
+	}
+	if err := writeEnvelope(c.w, rpcEnvelope{Type: typ, Payload: payload}); err != nil {
+		return rpcEnvelope{}, err
+	}
+	if err := c.w.Flush(); err != nil {
+		return rpcEnvelope{}, err
+	}
+	return readEnvelope(c.r)
 }
 
 func (t *TCPTransport) RequestVote(peer string, args RequestVoteArgs) (RequestVoteReply, error) {
