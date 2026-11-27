@@ -141,3 +141,47 @@ func TestConcurrentReadWriteWithFlushes(t *testing.T) {
 		}
 	}
 }
+
+// Concurrent puts and deletes on a few hot keys: what readers see before a
+// crash must be exactly what WAL replay rebuilds after it. This fails if a
+// batch could reach the MemTable in a different order than the WAL.
+func TestConcurrentSameKeyMemoryMatchesRecovery(t *testing.T) {
+	for round := 0; round < 5; round++ {
+		dir := t.TempDir()
+		e := reopen(t, dir)
+		var wg sync.WaitGroup
+		for w := 0; w < 16; w++ {
+			wg.Add(1)
+			go func(w int) {
+				defer wg.Done()
+				for i := 0; i < 40; i++ {
+					k := []byte(fmt.Sprintf("k%d", i%3))
+					if (w+i)%5 == 0 {
+						e.Delete(k)
+					} else {
+						e.Put(k, []byte(fmt.Sprintf("w%d-%d", w, i)))
+					}
+				}
+			}(w)
+		}
+		wg.Wait()
+		before := map[string]string{}
+		for i := 0; i < 3; i++ {
+			k := fmt.Sprintf("k%d", i)
+			if v, ok := e.Get([]byte(k)); ok {
+				before[k] = string(v)
+			}
+		}
+		crash(e)
+		e = reopen(t, dir)
+		for i := 0; i < 3; i++ {
+			k := fmt.Sprintf("k%d", i)
+			v, ok := e.Get([]byte(k))
+			bv, bok := before[k]
+			if ok != bok || string(v) != bv {
+				t.Fatalf("round %d, %s: memory before crash (%q, %v), recovered (%q, %v)", round, k, bv, bok, v, ok)
+			}
+		}
+		e.Close()
+	}
+}

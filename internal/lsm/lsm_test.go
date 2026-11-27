@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -354,5 +356,36 @@ func BenchmarkLSMPutNoSync(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		e.Put(key, val)
+	}
+}
+
+// BenchmarkLSMPutConcurrentWriters: durable Puts as the writer count grows.
+// With group commit, writers arriving during an fsync share the next one.
+func BenchmarkLSMPutConcurrentWriters(b *testing.B) {
+	for _, writers := range []int{1, 8, 64} {
+		b.Run(fmt.Sprintf("writers=%d", writers), func(b *testing.B) {
+			e, _ := Open(b.TempDir())
+			defer e.Close()
+			var next int64
+			var wg sync.WaitGroup
+			b.ResetTimer()
+			for w := 0; w < writers; w++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for {
+						i := atomic.AddInt64(&next, 1)
+						if i > int64(b.N) {
+							return
+						}
+						if err := e.Put([]byte(fmt.Sprintf("k%d", i)), []byte("v")); err != nil {
+							b.Error(err)
+							return
+						}
+					}
+				}()
+			}
+			wg.Wait()
+		})
 	}
 }

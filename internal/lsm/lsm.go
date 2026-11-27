@@ -295,26 +295,51 @@ type Options struct {
 
 // Engine is the top-level LSM storage engine. Safe for concurrent use.
 //
-// Locking: wmu serialises writers so WAL order equals MemTable order (the
-// same rule as internal/store: memory must never disagree with the log).
-// mu guards the in-memory structures; readers hold it only for lookups, so
-// they never wait on a writer's fsync. Lock order: wmu, then mu.
+// Locking: writes use leader-based group commit, as in internal/store.
+// Writers join wq; the first one to find no commit in progress leads: it
+// takes the queued batch, writes it to the WAL with one fsync, applies it
+// to the MemTable in queue order, wakes the batch's writers, and hands
+// leadership to the next waiter. One leader at a time keeps WAL order equal
+// to MemTable order (memory must never disagree with the log). wmu is held
+// by the leader while committing and by Flush/Close, so they never
+// interleave. mu guards the in-memory structures; readers hold it only for
+// lookups, so they never wait on a writer's fsync.
+// Lock order: wmu, then mu; qmu is a leaf.
 type Engine struct {
-	wmu      sync.Mutex
-	mu       sync.RWMutex
-	dir      string
-	opts     Options
-	memtable *MemTable
-	l0       []*SSTable // Level 0: recently flushed, oldest first, may overlap
-	l1       []*SSTable // Level 1: output of the last compaction (0 or 1 file)
-	nextID   int
-	closed   bool
+	wmu        sync.Mutex
+	qmu        sync.Mutex
+	wq         []*writeReq
+	committing bool
+	mu         sync.RWMutex
+	dir        string
+	opts       Options
+	memtable   *MemTable
+	l0         []*SSTable // Level 0: recently flushed, oldest first, may overlap
+	l1         []*SSTable // Level 1: output of the last compaction (0 or 1 file)
+	nextID     int
+	closed     bool
 
 	wal      *wal.WAL // WAL for the current MemTable
 	walFiles []string // WAL files whose contents are in the current MemTable
 }
 
 func walName(id int) string { return fmt.Sprintf("wal-%06d.log", id) }
+
+type writeReq struct {
+	en   entry
+	done chan writeResult // buffered(1)
+}
+
+// writeResult tells a waiting writer either that its write was committed
+// (lead=false, err) or that it is now the leader (lead=true).
+type writeResult struct {
+	err  error
+	lead bool
+}
+
+// maxBatch bounds one group commit, so a writer arriving during a huge
+// burst isn't stuck behind an unbounded batch.
+const maxBatch = 1024
 
 // Open opens the engine in dir, creating it if needed, and reloads any
 // SSTables left by a previous run.
@@ -429,8 +454,48 @@ func (e *Engine) Delete(key []byte) error {
 }
 
 func (e *Engine) write(en entry) error {
+	req := &writeReq{en: en, done: make(chan writeResult, 1)}
+	e.qmu.Lock()
+	e.wq = append(e.wq, req)
+	if e.committing {
+		e.qmu.Unlock()
+		r := <-req.done
+		if !r.lead {
+			return r.err
+		}
+		e.qmu.Lock()
+	} else {
+		e.committing = true
+	}
+
+	// Leader: our request is at the front of the queue.
+	n := len(e.wq)
+	if n > maxBatch {
+		n = maxBatch
+	}
+	batch := e.wq[:n:n]
+	e.wq = e.wq[n:]
+	e.qmu.Unlock()
+
 	e.wmu.Lock()
-	defer e.wmu.Unlock()
+	err := e.commitBatch(batch)
+	e.wmu.Unlock()
+	for _, r := range batch {
+		r.done <- writeResult{err: err}
+	}
+
+	e.qmu.Lock()
+	if len(e.wq) > 0 {
+		e.wq[0].done <- writeResult{lead: true}
+	} else {
+		e.committing = false
+		e.wq = nil
+	}
+	e.qmu.Unlock()
+	return (<-req.done).err
+}
+
+func (e *Engine) commitBatch(batch []*writeReq) error {
 	e.mu.RLock()
 	closed := e.closed
 	e.mu.RUnlock()
@@ -438,14 +503,16 @@ func (e *Engine) write(en entry) error {
 		return ErrClosed
 	}
 
-	// Write-ahead: the record is in the log (and, by default, on disk)
+	// Write-ahead: the batch is in the log (and, by default, on disk)
 	// before the MemTable — and therefore any reader — can see it.
-	rec := wal.Record{Type: wal.RecordPut, Key: []byte(en.key), Value: []byte(en.value)}
-	if en.deleted {
-		rec = wal.Record{Type: wal.RecordDelete, Key: []byte(en.key)}
-	}
-	if err := e.wal.Append(rec); err != nil {
-		return fmt.Errorf("lsm: wal append: %w", err)
+	for _, r := range batch {
+		rec := wal.Record{Type: wal.RecordPut, Key: []byte(r.en.key), Value: []byte(r.en.value)}
+		if r.en.deleted {
+			rec = wal.Record{Type: wal.RecordDelete, Key: []byte(r.en.key)}
+		}
+		if err := e.wal.Append(rec); err != nil {
+			return fmt.Errorf("lsm: wal append: %w", err)
+		}
 	}
 	sync := e.wal.Sync
 	if e.opts.NoSync {
@@ -457,10 +524,14 @@ func (e *Engine) write(en entry) error {
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.memtable.set(en)
+	for _, r := range batch {
+		e.memtable.set(r.en)
+	}
 	if e.memtable.size < e.opts.MemTableSize {
 		return nil
 	}
+	// The writes are durable and visible either way; a flush error is
+	// still reported so callers learn the engine can't flush.
 	return e.flushLocked()
 }
 
