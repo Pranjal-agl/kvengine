@@ -77,6 +77,8 @@ go test -v ./test/fault_injection/...
 
 This one takes about 30 seconds. It spawns a real subprocess, writes records in a loop with fsync after each, kills it with SIGKILL at a random point, and verifies no confirmed write was lost. Runs 15 times with different kill timing.
 
+`TestLSMFaultInjection` does the same against the LSM engine, with a 2 KB MemTable so the writer is constantly flushing and compacting when the kill lands. The recovered state must match the model after exactly the acknowledged operations (or one more, if the in-flight operation reached the WAL).
+
 Skip during fast iteration:
 
 ```bash
@@ -119,6 +121,11 @@ go test -race -v -timeout 60s ./internal/raft/...
 - `TestRestartWithSnapshotKeepsIndices`: a node restarted from snapshot + persisted log tail rejoins with correct absolute indices
 - `TestReadIndexFailsOnIsolatedLeader`: a leader that can't reach a quorum never hands out a read index
 - `TestReadIndexOnLeaderAndFollower`, `TestReadIndexSkipsNoOps`, `TestReadIndexWaitsForCurrentTermCommit`: the returned index covers every committed write, points at a real command, and is only issued once the leader has committed in its own term
+- `TestConcurrentReadsShareRounds`: 20 reads queued behind a stalled confirmation round complete in 2 rounds, not 20
+- `TestTruncationSurvivesRestart`, `TestNilVersusEmptyCommandOnDisk`, `TestTornLogTailRecovered`: the append-only log file replays truncations, no-ops and torn tails correctly
+- `TestSnapshotNewerThanLogFile`: crash between writing a snapshot and rewriting the log, in both the agreeing and conflicting cases
+- `TestLegacyStateFileMigrates`, `TestSnapshotCompactsLogFile`, `TestSingleNodeOnDiskCommitsAfterFsync`: format migration, log compaction on disk, and commit via the batched leader fsync
+- `TestTCPTransportReusesConnections`, `TestTCPTransportRetriesStaleConnection`, `TestTCPTransportCloseStopsExistingConnections`: connection pooling, transparent retry after a peer restart, and a closed transport going silent
 
 ### internal/raftkv
 
@@ -148,6 +155,8 @@ go test -race -v ./internal/lsm/...
 - `TestReopenRecoversSSTables`: flushed and compacted data (and tombstones) survive Close + Open
 - `TestReopenAfterInterruptedCompaction`: leftover inputs from a crashed compaction are discarded, not resurrected
 - `TestSparseIndexLookups`: every key and every gap between keys in a 500-entry table
+- `TestUnflushedWritesSurviveCrash`, `TestReplayOrderAfterInterruptedFlush`, `TestTornWALTailIgnored`: the memtable WAL recovers unflushed writes, replays leftover WALs oldest first, and ignores a torn tail
+- `TestWALFilesDoNotAccumulate`, `TestNoSyncSurvivesProcessCrash`, `TestConcurrentReadWriteWithFlushes`
 - `TestCompaction`: merges L0 into L1 correctly; updated keys show the new value, deleted keys are gone
 - `TestSSTableFileCountBounded`: after 20 rounds of writes and flushes, total SSTable file count stays bounded
 

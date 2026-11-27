@@ -53,7 +53,8 @@ A full PUT + GET over real TCP loopback costs about the same as a single WAL Put
 ## LSM engine
 
 ```
-BenchmarkLSMPut               ~60 ns/op    (in-memory MemTable write)
+BenchmarkLSMPut               ~160 us/op   (WAL fsync per write)
+BenchmarkLSMPutNoSync         ~0.5 us/op   (WAL write to the OS, no fsync)
 BenchmarkLSMGet               ~30 ns/op    (MemTable lookup)
 BenchmarkLSMGetAfterFlush     ~1.9 us/op   (1k-entry SSTable)
 BenchmarkLSMGetLargeSSTable   ~3.4 us/op   (100k-entry SSTable)
@@ -71,13 +72,15 @@ GetLargeSSTable (100k)        ~2.6 ms/op      ~3.4 us/op
 
 | Property | WAL store | LSM engine |
 |---|---|---|
-| Write latency | ~170 us (fsync, shared under concurrency) | ~60 ns (in-memory, fsync at flush) |
+| Write latency | ~170 us (fsync, shared under concurrency) | ~160 us (fsync per write); ~0.5 us with NoSync |
 | Read latency, hot | ~33 ns (map lookup) | ~30 ns (memtable lookup) |
 | Read latency, cold | ~33 ns (everything is in memory) | ~2-4 us (SSTable index + short scan) |
-| Durability window | Per write | MemTable flush (4 MiB) |
+| Durability window | Per write | Per write (NoSync: survives process crash, not power loss) |
 | Log growth | Forever without checkpointing | Bounded by compaction |
-| Memory | All data | MemTable + sparse indexes |
+| Memory | All data | MemTable + sparse indexes (data can exceed RAM) |
 | Complexity | Low | Medium |
+
+An earlier version measured LSM Put at ~60 ns, but that was an in-memory write with no WAL: unflushed data was lost on crash. With a WAL, the honest comparison is fsync against fsync. The LSM's advantages are memory (data can exceed RAM) and bounded files, not raw write speed. Group commit, which the WAL store has, would close the concurrent-writer gap.
 
 The remaining gap to production LSMs (LevelDB, RocksDB) for reads is bloom filters, which let a lookup skip a file without touching its index, and block caching.
 
@@ -90,11 +93,28 @@ End-to-end over the TCP transport: a 3-node cluster on one machine, one client, 
 ```
                          linearizable (default)    --stale-reads
 stale follower reads     0 / 200                   200 / 200
-follower GET p50 / p99   ~580 / ~1200 us           ~95 / ~380 us
-leader GET p50 / p99     ~250 / ~480 us            ~30 / ~85 us
+follower GET p50 / p99   ~230 / ~400 us            ~70 / ~170 us
+leader GET p50 / p99     ~90 / ~280 us             ~40 / ~100 us
 ```
 
-The stale column is the reason ReadIndex exists: a follower only learns the new commit index on the next heartbeat (every 50 ms), so a read right after a write is *always* stale there. A linearizable read pays one quorum heartbeat round trip, plus a hop to the leader when served by a follower. The TCP transport opens a connection per RPC, so a pooled transport would shave a good part of that.
+(Includes the Python test client's own overhead.) The stale column is the reason ReadIndex exists: a follower only learns the new commit index on the next heartbeat (every 50 ms), so a read right after a write is *always* stale there. A linearizable read pays one quorum heartbeat round trip, plus a hop to the leader when served by a follower.
+
+## Raft cluster, in process
+
+`internal/raftkv/bench_test.go` runs a 3-node cluster in one process over real loopback TCP with Raft state on disk, so the numbers include serialization, syscalls and fsync. Each row is a change made on this branch, measured back to back:
+
+```
+                                   Put        Put x16/op   Get(leader)  Get x16/op   Get(follower)
+baseline                           2.06 ms    1.19 ms      69 us        72 us        121 us
++ read batching                       -          -            -         13.6 us         -
++ pooled TCP connections              -          -         23 us         5.9 us      36 us
++ append-only Raft log             0.48 ms    0.25 ms         -            -            -
++ batched leader fsync             0.36 ms    0.19 ms         -            -            -
+```
+
+```bash
+go test -run xxx -bench Cluster -benchtime=3s ./internal/raftkv/
+```
 
 ---
 
@@ -126,5 +146,6 @@ Every performance decision in this project was made after looking at numbers, no
 - No protocol optimization: the network layer is a small fraction of the fsync floor.
 - Group commit: added once a concurrent-writers benchmark showed fsync-per-write left ~20x throughput on the table under load. The first version (a committer goroutine) cost ~30 us per write on the TCP benchmark from goroutine wakeups, so it was replaced with the leader pattern that keeps uncontended writes on the caller's goroutine.
 - LSM sparse index: a 100k-entry table made the linear scan's cost (milliseconds) obvious.
+- Raft write path: a CPU profile of cluster Puts showed 60% of time in persisting state (whole-log JSON rewrites with create/fsync/rename/dir-fsync) and ~7% dialing TCP. Fixing those two in that order cut Put latency 5.7x. Shortening the log first showed log length wasn't the main cost; the per-write file dance was.
 
 Running benchmarks before deciding whether to optimize is what prevents wasted effort on changes that would not matter, and running them after is what catches the ones that cost more than they should.

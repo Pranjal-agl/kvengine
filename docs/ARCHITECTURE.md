@@ -162,7 +162,18 @@ Leader Completeness: committed entries are never lost. Enforced by the vote rest
 
 ### Persistence
 
-Before responding to any RPC that changes state, the node persists currentTerm, votedFor, the log, and the log's starting index to disk via an atomic write (write tmp, fsync, rename, fsync dir). Without this, a restarted node could vote twice in the same term. Heartbeats that change nothing don't trigger a write.
+Before responding to any RPC that changes state, the node makes the change durable. Without this, a restarted node could vote twice in the same term or forget entries it acknowledged. Heartbeats that change nothing don't trigger a write.
+
+The state is split across two files (`internal/raft/persist.go`):
+
+- **Term and vote** go in a small JSON file, rewritten atomically (tmp, fsync, rename, fsync dir). This happens only on elections.
+- **The log** is an append-only file built on `internal/wal`, so records are checksummed and a torn tail is cut off on open. Appending costs one write plus one fsync, regardless of log length. Each record carries its absolute index, and writing entry *i* supersedes any entries ≥ *i* on replay. That is how a follower's truncation of a conflicting suffix is recorded without rewriting the file. The file starts with a base record (the snapshot index and term) and is rewritten only when a snapshot compacts the log.
+
+An earlier version rewrote everything, log included, as one JSON file on every change: create, fsync, rename and fsync the directory, for each entry. Replacing that cut a 3-node cluster's Put from ~2.1 ms to ~0.5 ms. Old-format files are migrated on first start.
+
+**Crash between snapshot and log.** The snapshot file is written first, then the log file is rewritten. If a crash lands in between, the log's base is older than the snapshot. Restore keeps only the entries after the snapshot, and only if the log agrees with the snapshot at its last index. It then rewrites the file: otherwise a log that *conflicted* with the snapshot would keep those entries on disk, and on the next restart they would take down any entries appended in between (`TestSnapshotNewerThanLogFile` fails without that rewrite).
+
+**Leader batching (thesis §10.2.1).** A leader appends proposals to memory and replicates them immediately; a background loop fsyncs everything pending in one batch. The leader counts itself toward a majority only for entries it has made durable (`durableIndex`), so a committed entry is always on disk on a majority. Followers still persist before replying. With 16 concurrent clients this brings per-write cost to ~0.19 ms.
 
 If persisting fails, the node panics. A node that can't make its vote or log durable can't safely participate, and carrying on would hide the problem until a restart silently broke an invariant.
 
@@ -172,7 +183,7 @@ Three transports:
 
 `MemTransport`: in-process, direct method calls. Used in tests. Supports partition injection.
 
-`TCPTransport`: real TCP connections, JSON-encoded RPCs (RequestVote, AppendEntries, InstallSnapshot). Used when running actual processes.
+`TCPTransport`: real TCP connections, JSON-encoded RPCs (RequestVote, AppendEntries, InstallSnapshot, ReadIndex). Used when running actual processes. Connections are persistent: each carries one request at a time, and up to 4 idle ones per peer are pooled. Concurrent RPCs use separate connections, so a slow InstallSnapshot never delays a heartbeat. A dead pooled connection is retried once on a fresh one, which is safe because every Raft RPC is idempotent. `Close` also closes inbound connections, so a stopped node can't keep answering on connections that were already open. Dialing per RPC used to cost a handshake on every heartbeat; pooling cut leader read latency over loopback from 69 µs to 23 µs.
 
 `SimTransport`: in-process with a seeded PRNG controlling message drops. Any test failure with seed S can be reproduced exactly by re-running with seed S.
 
@@ -210,7 +221,9 @@ Followers send a `ReadIndex` RPC to the leader, which runs steps 1-3 and returns
 
 One detail: the commit index right after an election is the leader's no-op, which is never delivered on `applyCh`. A state machine tracking progress from `applyCh` would wait for it forever, so ReadIndex steps back to the last entry that carries a command. The state there is identical.
 
-Cost: one heartbeat round trip per read on the leader (~250 us p50 over the TCP transport), plus a hop to the leader on followers (~580 us). Concurrent reads currently each start their own round; batching them, or leader leases, would cut this.
+**Batching.** At most one confirmation round is in flight. Reads that arrive meanwhile are assigned the *next* round, which starts the moment the current one reaches a quorum. Every read still waits for a round that began after it arrived, so safety is unchanged, but N concurrent reads cost about one round trip instead of N broadcasts. `TestConcurrentReadsShareRounds` holds a round open, fires 20 reads, and checks they complete in 2 rounds.
+
+Cost: one heartbeat round trip per read on the leader (~90 µs p50 end to end over TCP), plus a hop to the leader on followers (~230 µs). 16 concurrent leader reads cost ~6 µs each. Leader leases would remove the round trip, at the price of assuming bounded clock drift.
 
 The proof is in the tests: `TestLinearizableHistory` records concurrent writes through the leader and reads from all three nodes, then runs the Wing-Gong checker in `internal/linearcheck` on the history. With ReadIndex disabled, it and `TestDeposedLeaderCannotServeStaleRead` fail every time.
 
@@ -218,7 +231,17 @@ The proof is in the tests: `TestLinearizableHistory` records concurrent writes t
 
 ## LSM storage engine
 
-The LSM engine in `internal/lsm` is an alternative to the WAL-backed store. The core tradeoff: writes are much faster because they go to an in-memory MemTable and are only fsynced when the MemTable fills, but unflushed data is lost on crash (the MemTable has no WAL yet).
+The LSM engine in `internal/lsm` is an alternative to the WAL-backed store. Where the WAL store keeps every key in memory, the LSM keeps only the MemTable and sparse indexes in memory and the data in sorted files, so it can hold more data than RAM.
+
+### Write-ahead log
+
+Every write is appended to a WAL and fsynced before it reaches the MemTable, so a reader never sees a value that recovery couldn't rebuild. Each MemTable generation has its own WAL file (`wal-NNNNNN.log`). On flush, the SSTable is made durable *before* its WAL is deleted, so at every instant each write is in at least one of the two. A WAL that survives a crash next to its SSTable is replayed on open; that only re-applies values the SSTable already has, in order, which is harmless. `Open` replays leftover WALs oldest first (`TestReplayOrderAfterInterruptedFlush` fails if the order is reversed) and flushes the result.
+
+Writers serialize on their own mutex, so WAL order equals MemTable order (the same rule as the WAL store), and readers never wait on a writer's fsync. `Options.NoSync` skips the per-write fsync: writes still reach the OS before returning, so they survive a process crash, but not a power failure.
+
+Before the WAL, the engine's fast writes (~60 ns) were fast because they weren't durable: anything not yet flushed was lost on crash. A durable LSM Put now costs one fsync (~160 µs), the same as the WAL store; `NoSync` costs ~0.5 µs.
+
+`TestLSMFaultInjection` runs a writer with a 2 KB MemTable, so it is constantly flushing and compacting, and SIGKILLs it at random points. The recovered state must equal the model after exactly the acknowledged operations, or one more (the operation in flight may or may not have landed). With the WAL disabled it fails on the first trial.
 
 ### SSTable format and reads
 
@@ -232,7 +255,7 @@ SSTables are written to a `.tmp` file, fsynced, renamed, and the directory fsync
 
 ### Write path
 
-Writes go to the MemTable, an in-memory map that is sorted when it is flushed. When the MemTable exceeds the size limit (4 MiB), it flushes to an SSTable file on disk and a new MemTable starts.
+Writes go to the MemTable, an in-memory map that is sorted when it is flushed. When the MemTable exceeds the size limit (4 MiB by default, `Options.MemTableSize`), it flushes to an SSTable file on disk and a new MemTable and WAL start.
 
 ### Read path
 

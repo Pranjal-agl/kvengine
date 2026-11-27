@@ -48,3 +48,14 @@ go test -short ./...                         # skip it (it's slower; spawns proc
   deterministically (e.g. a fake filesystem that can be told "fail/truncate
   the Nth write") so failures are 100% reproducible from a seed. Worth doing
   if this project goes deep on the testing side; not required for Phase 1.
+
+## LSM engine
+
+`lsm_fault_test.go` applies the same method to `internal/lsm`.
+`lsmwriter/main.go` writes a deterministic stream of puts and deletes over
+40 keys, with a 2 KB MemTable so flushes and L0→L1 compactions happen
+constantly, and prints `DONE <i>` after each operation returns. After the
+kill, the test reopens the engine (replaying any WALs) and compares every
+key with a model of the stream. The state must equal the model after
+exactly the acknowledged operations, or after one more: the operation in
+flight when the kill landed may or may not have reached the WAL.

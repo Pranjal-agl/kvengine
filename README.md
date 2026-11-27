@@ -20,7 +20,7 @@ go test -race ./...   # all green
 - **Leader-follower replication** - WAL streamed to followers with crash-safe resume via persisted byte offset.
 - **Raft consensus** - leader election, log replication, snapshots with InstallSnapshot for lagging followers. Writes are acknowledged only once committed by a quorum. Survives leader failures and network partitions.
 - **Linearizable reads from any node** - GETs use ReadIndex (Raft thesis §6.4): the leader confirms it still holds a quorum before answering, and followers ask the leader for a read index and catch up before reading locally. A partitioned ex-leader refuses reads instead of serving stale data. Checked with a Wing-Gong linearizability checker over concurrent histories.
-- **LSM storage engine** - a MemTable + SSTable alternative to the WAL store, with sparse-indexed SSTables, crash-safe reload, and L0 to L1 compaction that bounds file count.
+- **LSM storage engine** - a MemTable + SSTable alternative to the WAL store: write-ahead logged (survives SIGKILL mid-flush and mid-compaction), sparse-indexed SSTables, and L0 to L1 compaction that bounds file count.
 
 ---
 
@@ -124,6 +124,8 @@ make flamegraph          # CPU flamegraph under load -> profiles/cpu.svg
 | `internal/raftkv` | `TestLinearizableHistory`, `TestDeposedLeaderCannotServeStaleRead` | Concurrent writes + reads from every node form a linearizable history; a partitioned ex-leader refuses reads |
 | `internal/lsm` | `TestCompaction`, `TestTombstoneInSSTableShadowsOlderSSTable` | Compaction merges levels correctly; deletes shadow older values in every layer |
 | `internal/lsm` | `TestReopenAfterInterruptedCompaction` | A crash mid-compaction can't resurrect deleted or overwritten data |
+| `test/fault_injection` | `TestLSMFaultInjection` | SIGKILL during constant flushes/compactions never loses an acknowledged LSM write |
+| `internal/raft` | `TestSnapshotNewerThanLogFile`, `TestTruncationSurvivesRestart` | The append-only Raft log recovers from a crash between snapshot and log rewrite; follower truncations are durable |
 | `internal/linearcheck` | `TestConcurrentStoreLinearizable`, `TestCheckNotLinearizable` | 48 concurrent ops on a real store are linearizable; violations are detected |
 | `internal/linearcheck` | `TestCheckScalesToLargeHistories` | The checker handles 3,000-op histories in well under a second (per-key decomposition + memoisation) |
 
@@ -141,10 +143,11 @@ Measured on a 2-vCPU cloud VM; fsync latency dominates, so absolute numbers vary
 | WAL store Put, 64 concurrent writers | ~7 us per write | group commit: one fsync per batch |
 | WAL store Get | ~33 ns | map lookup |
 | TCP PUT+GET round-trip | ~175 us | fsync |
-| LSM Put (in-memory) | ~60 ns | memtable write, no fsync |
+| LSM Put (durable / `NoSync`) | ~160 us / ~0.5 us | WAL fsync / WAL write to the OS |
 | LSM Get from a 100k-entry SSTable | ~3.4 us | sparse index + one short scan |
-| Raft GET on leader / follower (p50, TCP) | ~250 us / ~580 us | ReadIndex quorum round (+ hop to leader) |
-| Raft GET with `--stale-reads` (p50, TCP) | ~30-90 us | local map lookup, no consistency guarantee |
+| Raft PUT, 3 nodes over TCP (1 / 16 concurrent clients) | ~360 us / ~190 us per op | fsync on leader + follower |
+| Raft GET on leader / follower (p50, TCP) | ~90 us / ~230 us | ReadIndex quorum round (+ hop to leader) |
+| Raft GET with `--stale-reads` (p50, TCP) | ~40-70 us | local map lookup, no consistency guarantee |
 
 The short version: fsync dominates writes by about 5,000x. I benchmarked map sharding before deciding not to add it, since it would have shaved nanoseconds off an operation that costs microseconds. Group commit attacks the fsync itself: with 64 concurrent writers it cuts the per-write cost by ~25x.
 
@@ -169,10 +172,10 @@ Keys are whitespace-delimited text. Values are length-prefixed binary, so arbitr
 
 ## Known gaps
 
-- **Each linearizable read costs a quorum round trip.** Concurrent reads each trigger their own heartbeat round rather than sharing one, and there are no leader leases (which trade a clock-drift assumption for skipping the round trip).
+- **Each linearizable read costs a quorum round trip** (concurrent reads share one). There are no leader leases, which would skip the round trip at the cost of assuming bounded clock drift.
 - **Raft membership changes** are not implemented; the cluster is fixed at startup.
-- **Raft persistence rewrites the whole log** as JSON on every change. Snapshots keep the log short, so this is bounded, but a real implementation would append.
-- **LSM MemTable has no WAL**, so unflushed writes are lost on crash (the engine is durable at Flush/Close). It also has no bloom filters, so a miss still checks every L0 file's index.
+- **Raft RPCs are JSON.** Fine at this scale; a binary encoding would cut CPU per entry.
+- **LSM has no bloom filters**, so a miss still checks every L0 file's index, and LSM writers don't group-commit (each durable Put is its own fsync).
 - **Single-node WAL store never compacts its log.** It grows with every write until rewritten.
 
 ---
