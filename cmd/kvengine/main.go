@@ -16,7 +16,7 @@
 //	              --peers <id=host:raftport,id=host:raftport,...> \
 //	              --raft-addr <host:raftport> \
 //	              --kv-addr <host:kvport> \
-//	              --data-dir <dir> [--snapshot-every N]
+//	              --data-dir <dir> [--snapshot-every N] [--stale-reads]
 //	  e.g. (node 0 of 3):
 //	    kvengine raft --id node0 \
 //	      --peers "node1=127.0.0.1:7001,node2=127.0.0.1:7002" \
@@ -148,6 +148,7 @@ func runRaft(args []string) {
 	kvAddr := fs.String("kv-addr", ":6380", "address for the client KV protocol")
 	dataDir := fs.String("data-dir", ".", "directory for Raft state and snapshots")
 	snapEvery := fs.Int("snapshot-every", 1000, "take a Raft snapshot after this many applied writes (0 = never)")
+	staleReads := fs.Bool("stale-reads", false, "serve GETs from local state without a read index (faster, may be stale)")
 	fs.Parse(args)
 
 	if *id == "" || *raftAddr == "" {
@@ -187,7 +188,7 @@ func runRaft(args []string) {
 	if err != nil {
 		fatal("raft node:", err)
 	}
-	kv, err := raftkv.New(node, applyCh, raftkv.Options{SnapshotEvery: *snapEvery})
+	kv, err := raftkv.New(node, applyCh, raftkv.Options{SnapshotEvery: *snapEvery, StaleReads: *staleReads})
 	if err != nil {
 		fatal("raft kv:", err)
 	}
@@ -235,7 +236,10 @@ Single-node (no Raft):
 
 Raft cluster node:
   kvengine raft --id <id> --raft-addr <addr> --kv-addr <addr> \
-                --peers <id=addr,...> --data-dir <dir> [--snapshot-every N]
+                --peers <id=addr,...> --data-dir <dir> [--snapshot-every N] [--stale-reads]
+
+  GETs are linearizable on every node by default (ReadIndex);
+  --stale-reads serves them from local state instead.
 
   Example — 3-node cluster on localhost:
     Terminal 1: kvengine raft --id n0 --raft-addr :7000 --kv-addr :6380 \

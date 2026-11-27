@@ -19,6 +19,7 @@ go test -race ./...   # all green
 - **Network protocol** - a binary-safe TCP protocol with explicit partial-read handling, per-connection deadlines, and backpressure isolation.
 - **Leader-follower replication** - WAL streamed to followers with crash-safe resume via persisted byte offset.
 - **Raft consensus** - leader election, log replication, snapshots with InstallSnapshot for lagging followers. Writes are acknowledged only once committed by a quorum. Survives leader failures and network partitions.
+- **Linearizable reads from any node** - GETs use ReadIndex (Raft thesis §6.4): the leader confirms it still holds a quorum before answering, and followers ask the leader for a read index and catch up before reading locally. A partitioned ex-leader refuses reads instead of serving stale data. Checked with a Wing-Gong linearizability checker over concurrent histories.
 - **LSM storage engine** - a MemTable + SSTable alternative to the WAL store, with sparse-indexed SSTables, crash-safe reload, and L0 to L1 compaction that bounds file count.
 
 ---
@@ -79,7 +80,8 @@ mkdir -p /tmp/kv/{n0,n1,n2}
   --peers "n0=:7000,n1=:7001" --data-dir /tmp/kv/n2
 
 # Write to whichever node responds +OK (that's the leader)
-# Read from any node
+# Read from any node: reads are linearizable everywhere (add --stale-reads
+# to serve them from local state instead, faster but possibly stale)
 printf 'PUT key 5\r\nvalue\r\n' | nc -q1 127.0.0.1 6380
 printf 'GET key\r\n'            | nc -q1 127.0.0.1 6381
 
@@ -119,6 +121,7 @@ make flamegraph          # CPU flamegraph under load -> profiles/cpu.svg
 | `internal/raft` | `TestVoteNotResetBySameTermHeartbeat` | A node never votes twice in one term (Election Safety) |
 | `internal/raft` | `TestReplicationContinuesAfterSnapshot`, `TestLaggingFollowerCatchesUpViaInstallSnapshot` | Replication keeps working after compaction; a follower behind the snapshot catches up via InstallSnapshot |
 | `internal/raftkv` | `TestIsolatedLeaderDoesNotAcknowledge`, `TestFullClusterRestartRecoversState` | A leader without a quorum never returns +OK; a full-cluster restart recovers all state |
+| `internal/raftkv` | `TestLinearizableHistory`, `TestDeposedLeaderCannotServeStaleRead` | Concurrent writes + reads from every node form a linearizable history; a partitioned ex-leader refuses reads |
 | `internal/lsm` | `TestCompaction`, `TestTombstoneInSSTableShadowsOlderSSTable` | Compaction merges levels correctly; deletes shadow older values in every layer |
 | `internal/lsm` | `TestReopenAfterInterruptedCompaction` | A crash mid-compaction can't resurrect deleted or overwritten data |
 | `internal/linearcheck` | `TestConcurrentStoreLinearizable`, `TestCheckNotLinearizable` | 48 concurrent ops on a real store are linearizable; violations are detected |
@@ -139,6 +142,8 @@ Measured on a 2-vCPU cloud VM; fsync latency dominates, so absolute numbers vary
 | TCP PUT+GET round-trip | ~175 us | fsync |
 | LSM Put (in-memory) | ~60 ns | memtable write, no fsync |
 | LSM Get from a 100k-entry SSTable | ~3.4 us | sparse index + one short scan |
+| Raft GET on leader / follower (p50, TCP) | ~250 us / ~580 us | ReadIndex quorum round (+ hop to leader) |
+| Raft GET with `--stale-reads` (p50, TCP) | ~30-90 us | local map lookup, no consistency guarantee |
 
 The short version: fsync dominates writes by about 5,000x. I benchmarked map sharding before deciding not to add it, since it would have shaved nanoseconds off an operation that costs microseconds. Group commit attacks the fsync itself: with 64 concurrent writers it cuts the per-write cost by ~25x.
 
@@ -155,13 +160,15 @@ DEL <key>\r\n                              ->  +OK\r\n
 <unknown>                                  ->  -ERR <message>\r\n
 ```
 
+In Raft mode, PUT/DEL on a follower return `-ERR not leader (leader is <id>)`, and a GET that can't confirm a quorum returns `-ERR` rather than possibly stale data.
+
 Keys are whitespace-delimited text. Values are length-prefixed binary, so arbitrary byte content works fine. Partial reads are handled correctly at every layer.
 
 ---
 
 ## Known gaps
 
-- **Reads are not linearizable in Raft mode.** Gets are served from the local state machine, so a follower (or a just-deposed leader) can return stale data. Fixing this needs ReadIndex or leader leases.
+- **Each linearizable read costs a quorum round trip.** Concurrent reads each trigger their own heartbeat round rather than sharing one, and there are no leader leases (which trade a clock-drift assumption for skipping the round trip).
 - **Raft membership changes** are not implemented; the cluster is fixed at startup.
 - **Raft persistence rewrites the whole log** as JSON on every change. Snapshots keep the log short, so this is bounded, but a real implementation would append.
 - **LSM MemTable has no WAL**, so unflushed writes are lost on crash (the engine is durable at Flush/Close). It also has no bloom filters, so a miss still checks every L0 file's index.

@@ -191,9 +191,28 @@ The snapshot file and the state file are written separately, snapshot first. The
 `raftkv.KV` sits between the TCP server and Raft:
 
 - **Writes** are proposed, then the caller waits for the entry at the returned (index, term) to be applied. If a different entry is applied at that index (a new leader overwrote it), the write fails with `ErrLost`. If nothing happens within the timeout, it fails with `ErrTimeout` (outcome unknown). A write is acknowledged only once a quorum has it *and* it's applied locally, so a leader that loses its quorum never returns +OK, and a client always reads its own acknowledged writes from the leader.
-- **Reads** come from the local state machine and are not linearizable (see Known gaps in the README).
+- **Reads** are linearizable by default via ReadIndex (next section). `--stale-reads` (`Options.StaleReads`) serves them from local state instead.
 - **State** is an in-memory store. The Raft log plus snapshots are the durable copy, so on boot the state machine is restored from the latest snapshot and the log is replayed from there. A separate WAL would only add a second fsync per write and a file that never shrinks.
 - **Encoding**: commands are JSON with `[]byte` fields (base64), and store snapshots are a list of base64 key/value pairs. Plain JSON strings would replace invalid UTF-8 with U+FFFD and silently corrupt binary keys and values.
+
+### Linearizable reads: ReadIndex
+
+Reading from local state is fast but not safe. A follower may not have applied the latest writes yet; with local reads, 200 out of 200 follower reads issued right after a write came back stale in an end-to-end test, because followers learn the commit index on the *next* heartbeat. Worse, a leader cut off by a partition keeps believing it is leader until it times out, and meanwhile the majority can elect a new leader and accept writes it will never see.
+
+ReadIndex (Raft thesis §6.4, `internal/raft/readindex.go`) makes reads linearizable without writing anything to the log:
+
+1. The leader waits until it has committed an entry from its current term (the election no-op). Before that, its commitIndex may lag what an earlier leader committed.
+2. It records `readIndex = commitIndex`.
+3. It starts a new heartbeat *round*: `hbRound` is bumped, and every AppendEntries/InstallSnapshot carries the round number current when it was built. Any reply from a peer that accepts our term (success or log mismatch) records `ackRound[peer]`. Once a majority (counting itself) has acked a round ≥ the read's round, no newer leader existed when the read arrived, so nothing past readIndex could have been committed.
+4. The caller waits until its state machine has applied readIndex, then reads locally.
+
+Followers send a `ReadIndex` RPC to the leader, which runs steps 1-3 and returns the index; the follower then waits to apply it locally. Only the leader answers, so a request can't loop. If the leader is unknown or can't confirm within the timeout, the read fails (`-ERR` on the wire) instead of falling back to local state.
+
+One detail: the commit index right after an election is the leader's no-op, which is never delivered on `applyCh`. A state machine tracking progress from `applyCh` would wait for it forever, so ReadIndex steps back to the last entry that carries a command. The state there is identical.
+
+Cost: one heartbeat round trip per read on the leader (~250 us p50 over the TCP transport), plus a hop to the leader on followers (~580 us). Concurrent reads currently each start their own round; batching them, or leader leases, would cut this.
+
+The proof is in the tests: `TestLinearizableHistory` records concurrent writes through the leader and reads from all three nodes, then runs the Wing-Gong checker in `internal/linearcheck` on the history. With ReadIndex disabled, it and `TestDeposedLeaderCannotServeStaleRead` fail every time.
 
 ---
 

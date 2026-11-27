@@ -83,6 +83,21 @@ The remaining gap to production LSMs (LevelDB, RocksDB) for reads is bloom filte
 
 ---
 
+## Raft reads
+
+End-to-end over the TCP transport: a 3-node cluster on one machine, one client, a write to the leader followed immediately by a read from a follower, 200 times.
+
+```
+                         linearizable (default)    --stale-reads
+stale follower reads     0 / 200                   200 / 200
+follower GET p50 / p99   ~580 / ~1200 us           ~95 / ~380 us
+leader GET p50 / p99     ~250 / ~480 us            ~30 / ~85 us
+```
+
+The stale column is the reason ReadIndex exists: a follower only learns the new commit index on the next heartbeat (every 50 ms), so a read right after a write is *always* stale there. A linearizable read pays one quorum heartbeat round trip, plus a hop to the leader when served by a follower. The TCP transport opens a connection per RPC, so a pooled transport would shave a good part of that.
+
+---
+
 ## Profiling the server
 
 `scripts/flamegraph.sh` runs the server under load, captures a 15-second CPU profile via pprof, and generates a flamegraph SVG:

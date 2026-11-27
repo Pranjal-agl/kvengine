@@ -117,6 +117,8 @@ go test -race -v -timeout 60s ./internal/raft/...
 - `TestReplicationContinuesAfterSnapshot`: every node snapshots every 5 entries; replication and apply keep working long after the first compaction
 - `TestLaggingFollowerCatchesUpViaInstallSnapshot`: a partitioned follower falls behind the leader's snapshot and catches up via InstallSnapshot
 - `TestRestartWithSnapshotKeepsIndices`: a node restarted from snapshot + persisted log tail rejoins with correct absolute indices
+- `TestReadIndexFailsOnIsolatedLeader`: a leader that can't reach a quorum never hands out a read index
+- `TestReadIndexOnLeaderAndFollower`, `TestReadIndexSkipsNoOps`, `TestReadIndexWaitsForCurrentTermCommit`: the returned index covers every committed write, points at a real command, and is only issued once the leader has committed in its own term
 
 ### internal/raftkv
 
@@ -130,6 +132,10 @@ go test -race -v ./internal/raftkv/...
 - `TestBinarySafeThroughRaftAndSnapshots`: non-UTF-8 keys and values survive the Raft log, snapshots, and a restart
 - `TestFullClusterRestartRecoversState`: stop all nodes, start them again; all state comes back without any new write
 - `TestLaggingFollowerCatchesUpWithSnapshot`: end-to-end InstallSnapshot through the KV layer
+- `TestLinearizableHistory`: concurrent writes through the leader and reads from every node; the recorded history must pass the Wing-Gong linearizability checker
+- `TestFollowerReadsSeeAcknowledgedWrites`: a follower read issued right after a write is acknowledged returns that write
+- `TestDeposedLeaderCannotServeStaleRead`: a partitioned ex-leader (whose local state is stale) refuses linearizable reads
+- `TestFollowerReadWithNoQuorum`: with no quorum, follower reads fail promptly instead of hanging or going stale
 
 ### internal/lsm
 
@@ -221,7 +227,8 @@ printf 'PUT mykey 5\r\nhello\r\n' | nc -q1 127.0.0.1 6380
 printf 'PUT mykey 5\r\nhello\r\n' | nc -q1 127.0.0.1 6381
 printf 'PUT mykey 5\r\nhello\r\n' | nc -q1 127.0.0.1 6382
 
-# Read from any node (reads are local)
+# Read from any node. Reads are linearizable: a follower asks the leader
+# for a read index and catches up before answering.
 printf 'GET mykey\r\n' | nc -q1 127.0.0.1 6381
 ```
 

@@ -321,3 +321,51 @@ func TestCloseDisconnectsClients(t *testing.T) {
 		t.Fatal("connection still open after Close (read timed out)")
 	}
 }
+
+// errStore is a KVStore whose reads go through GetErr and can fail.
+type errStore struct {
+	KVStore
+	err error
+}
+
+func (e errStore) GetErr(key []byte) ([]byte, bool, error) {
+	if e.err != nil {
+		return nil, false, e.err
+	}
+	v, ok := e.KVStore.Get(key)
+	return v, ok, nil
+}
+
+// TestGetUsesGetErr: when the store implements ErrGetter, a failed read is
+// reported as -ERR, never as a (possibly stale) local value or $-1.
+func TestGetUsesGetErr(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "s.wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	s.Put([]byte("k"), []byte("v"))
+
+	for _, tc := range []struct {
+		err  error
+		want string
+	}{
+		{nil, "$1\r\n"},
+		{fmt.Errorf("no quorum"), "-ERR get failed: no quorum\r\n"},
+	} {
+		srv := New(errStore{KVStore: s, err: tc.err})
+		ln, _ := net.Listen("tcp", "127.0.0.1:0")
+		go srv.Serve(ln)
+		conn, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		fmt.Fprint(conn, "GET k\r\n")
+		line, _ := bufio.NewReader(conn).ReadString('\n')
+		conn.Close()
+		srv.Close()
+		if line != tc.want {
+			t.Errorf("err=%v: got %q, want %q", tc.err, line, tc.want)
+		}
+	}
+}

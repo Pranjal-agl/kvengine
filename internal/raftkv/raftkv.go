@@ -4,11 +4,14 @@
 //
 // It satisfies server.KVStore, so the TCP server can sit directly on top.
 //
-// Consistency: a successful Put/Delete is durable on a majority and visible
-// to subsequent Gets on the same node. Gets do not go through Raft, so a
-// follower (or a leader that has just been deposed without knowing it yet)
-// can return stale data. Linearizable reads would need ReadIndex or leader
-// leases, which are not implemented.
+// Consistency: a successful Put/Delete is durable on a majority. Reads
+// through GetErr are linearizable by default, on any node: they obtain a
+// Raft read index (raft.Node.ReadIndex — a quorum heartbeat round, plus a
+// round trip to the leader when called on a follower), wait for the local
+// state machine to apply it, then read locally. A read therefore reflects
+// every write that completed before it began, and a deposed leader cannot
+// serve stale data. Options.StaleReads skips the read index for lower
+// latency at the cost of possibly stale results.
 package raftkv
 
 import (
@@ -54,6 +57,12 @@ type Options struct {
 	SnapshotEvery int
 	// WriteTimeout bounds how long Put/Delete wait for commit. Default 5s.
 	WriteTimeout time.Duration
+	// ReadTimeout bounds how long a linearizable read waits to confirm
+	// leadership and catch up. Default 2s.
+	ReadTimeout time.Duration
+	// StaleReads serves GetErr straight from the local state machine,
+	// skipping the read index: faster, but may return stale data.
+	StaleReads bool
 	// Logger receives operational messages. Default: log.Default().
 	Logger *log.Logger
 }
@@ -81,6 +90,7 @@ type KV struct {
 	mu      sync.Mutex
 	waiters map[uint64]*waiter // by log index
 	applied uint64             // last applied index (commands or snapshot)
+	advance chan struct{}      // closed and replaced whenever applied moves
 
 	sinceSnapshot int // commands applied since the last snapshot; apply loop only
 
@@ -96,6 +106,9 @@ func New(node *raft.Node, applyCh <-chan raft.ApplyMsg, opts Options) (*KV, erro
 	if opts.WriteTimeout <= 0 {
 		opts.WriteTimeout = 5 * time.Second
 	}
+	if opts.ReadTimeout <= 0 {
+		opts.ReadTimeout = 2 * time.Second
+	}
 	if opts.Logger == nil {
 		opts.Logger = log.Default()
 	}
@@ -105,6 +118,7 @@ func New(node *raft.Node, applyCh <-chan raft.ApplyMsg, opts Options) (*KV, erro
 		sm:      store.NewMemory(),
 		opts:    opts,
 		waiters: make(map[uint64]*waiter),
+		advance: make(chan struct{}),
 		stop:    make(chan struct{}),
 		done:    make(chan struct{}),
 	}
@@ -140,8 +154,61 @@ func (kv *KV) Delete(key []byte) error {
 	return kv.propose(command{Op: "del", Key: key})
 }
 
-// Get reads from the local state machine (see package doc on staleness).
+// Get reads straight from the local state machine, without a read index.
+// It may be stale; use GetErr for linearizable reads. (Get exists to
+// satisfy server.KVStore; the server prefers GetErr when available.)
 func (kv *KV) Get(key []byte) ([]byte, bool) { return kv.sm.Get(key) }
+
+// GetErr is a linearizable read (unless Options.StaleReads): it returns the
+// value as of some point between the call and its return, reflecting every
+// write acknowledged before the call. Returns *NotLeaderError if no leader
+// can confirm the read, or ErrTimeout.
+func (kv *KV) GetErr(key []byte) ([]byte, bool, error) {
+	if !kv.opts.StaleReads {
+		deadline := time.Now().Add(kv.opts.ReadTimeout)
+		idx, err := kv.node.ReadIndex(kv.opts.ReadTimeout)
+		if err != nil {
+			var nle *raft.NotLeaderError
+			if errors.As(err, &nle) {
+				return nil, false, &NotLeaderError{LeaderID: nle.LeaderId}
+			}
+			return nil, false, fmt.Errorf("raftkv: read: %w", err)
+		}
+		if err := kv.waitApplied(idx, deadline); err != nil {
+			return nil, false, err
+		}
+	}
+	v, ok := kv.sm.Get(key)
+	return v, ok, nil
+}
+
+// waitApplied blocks until the state machine has applied index idx.
+func (kv *KV) waitApplied(idx uint64, deadline time.Time) error {
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	for {
+		kv.mu.Lock()
+		applied, ch := kv.applied, kv.advance
+		kv.mu.Unlock()
+		if applied >= idx {
+			return nil
+		}
+		select {
+		case <-ch:
+		case <-timer.C:
+			return fmt.Errorf("raftkv: read: timed out catching up to index %d (at %d)", idx, applied)
+		case <-kv.stop:
+			return ErrTimeout
+		}
+	}
+}
+
+// setApplied records progress and wakes readers. Called with kv.mu held.
+func (kv *KV) setApplied(idx uint64) {
+	kv.applied = idx
+	close(kv.advance)
+	kv.advance = make(chan struct{})
+}
 
 // Len returns the number of keys in the local state machine.
 func (kv *KV) Len() int { return kv.sm.Len() }
@@ -202,7 +269,7 @@ func (kv *KV) applySnapshot(msg raft.ApplyMsg) {
 		kv.opts.Logger.Fatalf("raftkv: cannot restore snapshot at index %d: %v", msg.SnapshotIndex, err)
 	}
 	kv.mu.Lock()
-	kv.applied = msg.SnapshotIndex
+	kv.setApplied(msg.SnapshotIndex)
 	for idx, w := range kv.waiters {
 		if idx <= msg.SnapshotIndex {
 			w.done <- ErrUnknown
@@ -229,7 +296,7 @@ func (kv *KV) applyCommand(msg raft.ApplyMsg) {
 	}
 
 	kv.mu.Lock()
-	kv.applied = msg.CommandIndex
+	kv.setApplied(msg.CommandIndex)
 	// Any waiter at or below this index is now decided: the entry at its
 	// index either is the one it proposed (same term) or replaced it.
 	// Indices skipped by apply (leader no-ops) count as replaced too.

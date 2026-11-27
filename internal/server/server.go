@@ -40,6 +40,14 @@ type KVStore interface {
 	Len() int
 }
 
+// ErrGetter is implemented by stores whose reads can fail — e.g. the
+// Raft-backed store, where a linearizable read needs a quorum. When the
+// backing store implements it, GET uses GetErr and reports failures as
+// -ERR instead of falling back to a possibly stale local read.
+type ErrGetter interface {
+	GetErr(key []byte) ([]byte, bool, error)
+}
+
 // Server serves the kvengine protocol over TCP, backed by a KVStore.
 type Server struct {
 	store KVStore
@@ -286,7 +294,17 @@ func (srv *Server) handleGet(w *bufio.Writer, fields []string) {
 		writeErr(w, fmt.Errorf("GET requires exactly 1 arg, got %d", len(fields)-1))
 		return
 	}
-	v, ok := srv.store.Get([]byte(fields[1]))
+	var v []byte
+	var ok bool
+	if eg, isEG := srv.store.(ErrGetter); isEG {
+		var err error
+		if v, ok, err = eg.GetErr([]byte(fields[1])); err != nil {
+			writeErr(w, fmt.Errorf("get failed: %w", err))
+			return
+		}
+	} else {
+		v, ok = srv.store.Get([]byte(fields[1]))
+	}
 	if !ok {
 		fmt.Fprint(w, "$-1\r\n")
 		return
