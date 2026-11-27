@@ -103,6 +103,7 @@ func runSingleNode(walPath string, args []string) {
 		if err := srv.ListenAndServe(rest[0]); err != nil && !errors.Is(err, net.ErrClosed) {
 			fatal("serve:", err)
 		}
+		waitForShutdown()
 	case "put":
 		if len(rest) != 2 {
 			usage()
@@ -211,9 +212,15 @@ func runRaft(args []string) {
 	if err := srv.ListenAndServe(*kvAddr); err != nil && !errors.Is(err, net.ErrClosed) {
 		fatal("kv serve:", err)
 	}
+	waitForShutdown()
 }
 
 // shutdownOnSignal runs cleanup on SIGINT/SIGTERM, then exits.
+//
+// Cleanup closes the server, which makes ListenAndServe return in main.
+// main must then call waitForShutdown rather than returning: returning from
+// main exits the process immediately, cutting cleanup off half-way (e.g.
+// in the middle of writing a snapshot).
 func shutdownOnSignal(cleanup func()) {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
@@ -221,9 +228,14 @@ func shutdownOnSignal(cleanup func()) {
 		sig := <-sigs
 		log.Printf("received %v, shutting down", sig)
 		cleanup()
+		log.Printf("shutdown complete")
 		os.Exit(0)
 	}()
 }
+
+// waitForShutdown blocks until the signal handler's cleanup exits the
+// process.
+func waitForShutdown() { select {} }
 
 func usage() {
 	fmt.Fprintln(os.Stderr, `kvengine — durable, Raft-replicated key-value store
