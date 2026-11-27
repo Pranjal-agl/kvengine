@@ -109,6 +109,7 @@ type SSTable struct {
 	minKey string
 	maxKey string
 	index  []indexEntry // every indexInterval-th entry
+	filter *bloom       // all keys in the table, tombstones included
 }
 
 type indexEntry struct {
@@ -166,6 +167,7 @@ func openSSTable(path string, level, id int) (*SSTable, error) {
 	sst := &SSTable{id: id, level: level, path: path, f: f, size: info.Size()}
 	r := bufio.NewReader(io.NewSectionReader(f, 0, sst.size))
 	var off int64
+	var hashes [][2]uint32
 	for n := 0; ; n++ {
 		e, sz, err := readEntry(r)
 		if err == io.EOF {
@@ -182,8 +184,11 @@ func openSSTable(path string, level, id int) (*SSTable, error) {
 		if n%indexInterval == 0 {
 			sst.index = append(sst.index, indexEntry{key: e.key, off: off})
 		}
+		h1, h2 := bloomHash(e.key)
+		hashes = append(hashes, [2]uint32{h1, h2})
 		off += sz
 	}
+	sst.filter = newBloom(hashes)
 	return sst, nil
 }
 
@@ -236,7 +241,7 @@ func readEntry(r *bufio.Reader) (entry, int64, error) {
 // at all — a tombstone counts as found, with e.deleted set, so the caller
 // stops searching older tables.
 func (sst *SSTable) get(key string) (e entry, found bool, err error) {
-	if len(sst.index) == 0 || key < sst.minKey || key > sst.maxKey {
+	if len(sst.index) == 0 || key < sst.minKey || key > sst.maxKey || !sst.filter.mayContain(key) {
 		return entry{}, false, nil
 	}
 	// Last index entry with key <= target.

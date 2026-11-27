@@ -389,3 +389,29 @@ func BenchmarkLSMPutConcurrentWriters(b *testing.B) {
 		})
 	}
 }
+
+// missEngine builds 3 L0 tables whose key ranges all overlap (so the
+// min/max range check can't skip any) holding even-numbered keys.
+func missEngine(tb testing.TB) *Engine {
+	e, _ := OpenWithOptions(tb.TempDir(), Options{MemTableSize: 1 << 30, NoSync: true})
+	for t := 0; t < 3; t++ {
+		for i := t * 2; i < 60000; i += 6 {
+			e.Put([]byte(fmt.Sprintf("k%07d", i)), []byte("value"))
+		}
+		e.Flush()
+	}
+	return e
+}
+
+// BenchmarkLSMGetMiss: lookups of absent keys that fall inside every
+// table's key range — the case bloom filters exist for.
+func BenchmarkLSMGetMiss(b *testing.B) {
+	e := missEngine(b)
+	defer e.Close()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, ok := e.Get([]byte(fmt.Sprintf("k%07d", (i*2+1)%60000))); ok {
+			b.Fatal("found an absent key")
+		}
+	}
+}
