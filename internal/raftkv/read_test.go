@@ -128,7 +128,7 @@ func TestLinearizableHistory(t *testing.T) {
 		}
 
 		rec := &linearcheck.Recorder{}
-		const clients, opsEach, keys = 6, 10, 2
+		const clients, opsEach, keys = 10, 30, 3
 		var wg sync.WaitGroup
 		var failed sync.Once
 		for g := 0; g < clients; g++ {

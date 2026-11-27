@@ -36,7 +36,7 @@ internal/
   raft/                    Raft consensus: election, replication, snapshots, TCP transport
   raftkv/                  KV state machine on Raft: commit-before-ack writes, snapshot restore
   lsm/                     LSM storage engine: MemTable + SSTables + compaction
-  linearcheck/             Linearizability checker (Wing-Gong model checker)
+  linearcheck/             Linearizability checker (Wing-Gong search, per-key + memoised)
 test/fault_injection/      SIGKILL-based crash durability harness
 scripts/                   flamegraph.sh, fuzz.sh
 docs/                      ARCHITECTURE.md, BENCHMARKS.md, TESTING.md
@@ -125,6 +125,7 @@ make flamegraph          # CPU flamegraph under load -> profiles/cpu.svg
 | `internal/lsm` | `TestCompaction`, `TestTombstoneInSSTableShadowsOlderSSTable` | Compaction merges levels correctly; deletes shadow older values in every layer |
 | `internal/lsm` | `TestReopenAfterInterruptedCompaction` | A crash mid-compaction can't resurrect deleted or overwritten data |
 | `internal/linearcheck` | `TestConcurrentStoreLinearizable`, `TestCheckNotLinearizable` | 48 concurrent ops on a real store are linearizable; violations are detected |
+| `internal/linearcheck` | `TestCheckScalesToLargeHistories` | The checker handles 3,000-op histories in well under a second (per-key decomposition + memoisation) |
 
 ---
 

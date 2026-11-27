@@ -255,7 +255,12 @@ Three bugs were caught by tests. First, the initial merge went newest-to-oldest 
 
 It records concurrent operations as (start time, end time, type, key, value, result) tuples and tries to find a valid sequential ordering consistent with real time: for each step, try every operation whose start time is before the earliest end time in the remaining set, apply it to a sequential reference model, and recurse. If the list empties, the history is linearizable.
 
-This is exponential in the worst case but fast in practice for small histories because the partial order from timestamps prunes most of the search space early.
+The plain search is factorial, and that bit for real: CI hit a 60-op history from the Raft read tests that ran for over nine minutes. Two standard optimisations fix it:
+
+- **Per-key decomposition.** Linearizability is local (Herlihy & Wing): a history over independent objects is linearizable iff each object's sub-history is. Each key is an independent register, so each is checked separately.
+- **Memoisation.** The search state is (set of ops already linearized, register value). Any path reaching a state already known to fail is cut off immediately. Lowe's checker and Porcupine use the same trick.
+
+The old checker didn't finish an 80-op generated history in 60 seconds. The new one checks 3,000 heavily overlapping ops in about 0.1 s (`TestCheckScalesToLargeHistories`), and it still rejects histories with a single corrupted read (`TestCheckFindsViolationInLargeHistory`).
 
 `TestCheckNotLinearizable` checks that an impossible history is correctly rejected: two concurrent Gets returning different values for the same key with no intervening Put between them.
 

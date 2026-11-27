@@ -132,7 +132,7 @@ go test -race -v ./internal/raftkv/...
 - `TestBinarySafeThroughRaftAndSnapshots`: non-UTF-8 keys and values survive the Raft log, snapshots, and a restart
 - `TestFullClusterRestartRecoversState`: stop all nodes, start them again; all state comes back without any new write
 - `TestLaggingFollowerCatchesUpWithSnapshot`: end-to-end InstallSnapshot through the KV layer
-- `TestLinearizableHistory`: concurrent writes through the leader and reads from every node; the recorded history must pass the Wing-Gong linearizability checker
+- `TestLinearizableHistory`: 10 clients, 300 ops per round, writes through the leader and reads from every node; the recorded history must pass the linearizability checker
 - `TestFollowerReadsSeeAcknowledgedWrites`: a follower read issued right after a write is acknowledged returns that write
 - `TestDeposedLeaderCannotServeStaleRead`: a partitioned ex-leader (whose local state is stale) refuses linearizable reads
 - `TestFollowerReadWithNoQuorum`: with no quorum, follower reads fail promptly instead of hanging or going stale
@@ -159,6 +159,8 @@ go test -race -v ./internal/linearcheck/...
 
 - `TestCheckNotLinearizable`: two Gets returning different values with no Put between them is correctly identified as impossible
 - `TestConcurrentStoreLinearizable`: 6 goroutines, 8 ops each, 3 keys; records every operation against a real Store and verifies the full history is linearizable
+- `TestCheckScalesToLargeHistories`: 3,000-op, heavily overlapping histories (linearizable by construction) check in well under a second
+- `TestCheckFindsViolationInLargeHistory`, `TestCheckFindsStaleRead`: a single bad read in a large history, or a read of an overwritten value, is still caught
 
 ---
 
