@@ -20,7 +20,7 @@ go test -race ./...   # all green
 - **Leader-follower replication** - WAL streamed to followers with crash-safe resume via persisted byte offset.
 - **Raft consensus** - leader election, log replication, snapshots with InstallSnapshot for lagging followers. Writes are acknowledged only once committed by a quorum. Survives leader failures and network partitions.
 - **Linearizable reads from any node** - GETs use ReadIndex (Raft thesis §6.4): the leader confirms it still holds a quorum before answering, and followers ask the leader for a read index and catch up before reading locally. A partitioned ex-leader refuses reads instead of serving stale data. Checked with a Wing-Gong linearizability checker over concurrent histories.
-- **LSM storage engine** - a MemTable + SSTable alternative to the WAL store: write-ahead logged (survives SIGKILL mid-flush and mid-compaction), sparse-indexed SSTables, and L0 to L1 compaction that bounds file count.
+- **LSM storage engine** - a MemTable + SSTable alternative to the WAL store: write-ahead logged with group commit (survives SIGKILL mid-flush and mid-compaction), sparse indexes and bloom filters on SSTables, and L0 to L1 compaction that bounds file count.
 
 ---
 
@@ -125,6 +125,7 @@ make flamegraph          # CPU flamegraph under load -> profiles/cpu.svg
 | `internal/lsm` | `TestCompaction`, `TestTombstoneInSSTableShadowsOlderSSTable` | Compaction merges levels correctly; deletes shadow older values in every layer |
 | `internal/lsm` | `TestReopenAfterInterruptedCompaction` | A crash mid-compaction can't resurrect deleted or overwritten data |
 | `test/fault_injection` | `TestLSMFaultInjection` | SIGKILL during constant flushes/compactions never loses an acknowledged LSM write |
+| `internal/lsm` | `TestConcurrentSameKeyMemoryMatchesRecovery`, `TestBloomNoFalseNegativesAndLowFPRate` | LSM group commit keeps memory and WAL in the same order; bloom filters never miss a present key, ~0.8% false positives |
 | `internal/raft` | `TestSnapshotNewerThanLogFile`, `TestTruncationSurvivesRestart` | The append-only Raft log recovers from a crash between snapshot and log rewrite; follower truncations are durable |
 | `internal/linearcheck` | `TestConcurrentStoreLinearizable`, `TestCheckNotLinearizable` | 48 concurrent ops on a real store are linearizable; violations are detected |
 | `internal/linearcheck` | `TestCheckScalesToLargeHistories` | The checker handles 3,000-op histories in well under a second (per-key decomposition + memoisation) |
@@ -144,7 +145,9 @@ Measured on a 2-vCPU cloud VM; fsync latency dominates, so absolute numbers vary
 | WAL store Get | ~33 ns | map lookup |
 | TCP PUT+GET round-trip | ~175 us | fsync |
 | LSM Put (durable / `NoSync`) | ~160 us / ~0.5 us | WAL fsync / WAL write to the OS |
+| LSM Put, 64 concurrent writers | ~7 us per write | group commit: one fsync per batch |
 | LSM Get from a 100k-entry SSTable | ~3.4 us | sparse index + one short scan |
+| LSM Get of an absent key (3 overlapping tables) | ~0.24 us | bloom filters skip every table |
 | Raft PUT, 3 nodes over TCP (1 / 16 concurrent clients) | ~360 us / ~190 us per op | fsync on leader + follower |
 | Raft GET on leader / follower (p50, TCP) | ~90 us / ~230 us | ReadIndex quorum round (+ hop to leader) |
 | Raft GET with `--stale-reads` (p50, TCP) | ~40-70 us | local map lookup, no consistency guarantee |
@@ -175,7 +178,7 @@ Keys are whitespace-delimited text. Values are length-prefixed binary, so arbitr
 - **Each linearizable read costs a quorum round trip** (concurrent reads share one). There are no leader leases, which would skip the round trip at the cost of assuming bounded clock drift.
 - **Raft membership changes** are not implemented; the cluster is fixed at startup.
 - **Raft RPCs are JSON.** Fine at this scale; a binary encoding would cut CPU per entry.
-- **LSM has no bloom filters**, so a miss still checks every L0 file's index, and LSM writers don't group-commit (each durable Put is its own fsync).
+- **LSM has only two levels.** Compaction merges all of L0 into a single L1 file, so each compaction rewrites everything; a leveled or tiered scheme would bound that write amplification.
 - **Single-node WAL store never compacts its log.** It grows with every write until rewritten.
 
 ---

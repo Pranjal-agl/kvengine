@@ -58,6 +58,23 @@ BenchmarkLSMPutNoSync         ~0.5 us/op   (WAL write to the OS, no fsync)
 BenchmarkLSMGet               ~30 ns/op    (MemTable lookup)
 BenchmarkLSMGetAfterFlush     ~1.9 us/op   (1k-entry SSTable)
 BenchmarkLSMGetLargeSSTable   ~3.4 us/op   (100k-entry SSTable)
+BenchmarkLSMGetMiss           ~0.24 us/op  (absent key inside 3 overlapping tables)
+```
+
+Durable LSM Puts group-commit like the WAL store:
+
+```
+                     before (fsync per write)   after (group commit)
+writers=1            ~151 us/op                 ~161 us/op
+writers=8            ~160 us/op                 ~39 us/op
+writers=64           ~184 us/op                 ~6.7 us/op
+```
+
+Bloom filters (10 bits/key, ~0.8% false positives) answer most misses without reading a table:
+
+```
+                              before          after
+GetMiss (3 tables, in range)  ~8.1 us/op      ~0.24 us/op
 ```
 
 SSTable reads use a sparse index (every 16th key) to seek near the key, then scan at most 16 entries. Before the index, reads were a linear scan of the whole file, opened fresh on every Get:
@@ -72,7 +89,7 @@ GetLargeSSTable (100k)        ~2.6 ms/op      ~3.4 us/op
 
 | Property | WAL store | LSM engine |
 |---|---|---|
-| Write latency | ~170 us (fsync, shared under concurrency) | ~160 us (fsync per write); ~0.5 us with NoSync |
+| Write latency | ~170 us (fsync, shared under concurrency) | ~160 us (fsync, shared under concurrency); ~0.5 us with NoSync |
 | Read latency, hot | ~33 ns (map lookup) | ~30 ns (memtable lookup) |
 | Read latency, cold | ~33 ns (everything is in memory) | ~2-4 us (SSTable index + short scan) |
 | Durability window | Per write | Per write (NoSync: survives process crash, not power loss) |
@@ -80,9 +97,9 @@ GetLargeSSTable (100k)        ~2.6 ms/op      ~3.4 us/op
 | Memory | All data | MemTable + sparse indexes (data can exceed RAM) |
 | Complexity | Low | Medium |
 
-An earlier version measured LSM Put at ~60 ns, but that was an in-memory write with no WAL: unflushed data was lost on crash. With a WAL, the honest comparison is fsync against fsync. The LSM's advantages are memory (data can exceed RAM) and bounded files, not raw write speed. Group commit, which the WAL store has, would close the concurrent-writer gap.
+An earlier version measured LSM Put at ~60 ns, but that was an in-memory write with no WAL: unflushed data was lost on crash. With a WAL, the honest comparison is fsync against fsync. The LSM's advantages are memory (data can exceed RAM) and bounded files, not raw write speed.
 
-The remaining gap to production LSMs (LevelDB, RocksDB) for reads is bloom filters, which let a lookup skip a file without touching its index, and block caching.
+What's left compared with production LSMs (LevelDB, RocksDB): a block cache, and a multi-level compaction scheme. Here every compaction rewrites all of L1.
 
 ---
 

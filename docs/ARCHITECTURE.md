@@ -237,7 +237,7 @@ The LSM engine in `internal/lsm` is an alternative to the WAL-backed store. Wher
 
 Every write is appended to a WAL and fsynced before it reaches the MemTable, so a reader never sees a value that recovery couldn't rebuild. Each MemTable generation has its own WAL file (`wal-NNNNNN.log`). On flush, the SSTable is made durable *before* its WAL is deleted, so at every instant each write is in at least one of the two. A WAL that survives a crash next to its SSTable is replayed on open; that only re-applies values the SSTable already has, in order, which is harmless. `Open` replays leftover WALs oldest first (`TestReplayOrderAfterInterruptedFlush` fails if the order is reversed) and flushes the result.
 
-Writers serialize on their own mutex, so WAL order equals MemTable order (the same rule as the WAL store), and readers never wait on a writer's fsync. `Options.NoSync` skips the per-write fsync: writes still reach the OS before returning, so they survive a process crash, but not a power failure.
+Writes use the same leader-based group commit as the WAL store: concurrent writers share one fsync, and each batch is applied to the MemTable in queue order with one leader at a time, so WAL order always equals MemTable order (`TestConcurrentSameKeyMemoryMatchesRecovery` fails if a batch is applied out of order). With 64 writers a durable Put costs ~7 µs instead of ~184 µs. Readers never wait on a writer's fsync. A first version had writers take turns on a mutex and found their write already committed only when their turn came; those serial wake-ups capped the gain at ~27 µs per write. `Options.NoSync` skips the per-write fsync: writes still reach the OS before returning, so they survive a process crash, but not a power failure.
 
 Before the WAL, the engine's fast writes (~60 ns) were fast because they weren't durable: anything not yet flushed was lost on crash. A durable LSM Put now costs one fsync (~160 µs), the same as the WAL store; `NoSync` costs ~0.5 µs.
 
@@ -248,6 +248,8 @@ Before the WAL, the engine's fast writes (~60 ns) were fast because they weren't
 Each entry is `[1]kind [4]keyLen [4]valLen key value`, sorted by key, where kind is put or tombstone. (Tombstones used to be a magic value string, which meant storing that exact string deleted the key.)
 
 On open or write, each SSTable builds a sparse in-memory index holding the offset of every 16th key. A lookup checks the table's key range, binary-searches the index, seeks, and scans at most 16 entries, stopping early because keys are sorted. Point reads in a 100k-entry table take ~3 us instead of ~2.6 ms for the original linear scan.
+
+Each SSTable also gets a Bloom filter over its keys (`bloom.go`), built during the same scan, so the file format doesn't change. It uses 10 bits per key and 7 probes derived from one FNV-1a hash (Kirsch-Mitzenmacher), for a ~0.8% false-positive rate (0.79% measured). A "no" is exact, so a lookup for an absent key skips the table without touching its index or the disk. Tombstones are in the filter, because a delete must still be found to stop the search. A miss across three overlapping tables went from ~8 µs to ~0.24 µs; the memory cost is 1.25 bytes per key.
 
 ### Durability and recovery
 

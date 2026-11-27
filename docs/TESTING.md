@@ -157,6 +157,8 @@ go test -race -v ./internal/lsm/...
 - `TestSparseIndexLookups`: every key and every gap between keys in a 500-entry table
 - `TestUnflushedWritesSurviveCrash`, `TestReplayOrderAfterInterruptedFlush`, `TestTornWALTailIgnored`: the memtable WAL recovers unflushed writes, replays leftover WALs oldest first, and ignores a torn tail
 - `TestWALFilesDoNotAccumulate`, `TestNoSyncSurvivesProcessCrash`, `TestConcurrentReadWriteWithFlushes`
+- `TestConcurrentSameKeyMemoryMatchesRecovery`: under group commit, 16 writers on 3 hot keys; memory before a crash must equal WAL replay after it
+- `TestBloomNoFalseNegativesAndLowFPRate`, `TestBloomSkipsTablesOnMiss`: no false negatives, ~0.8% false positives, misses skip tables, tombstones still found
 - `TestCompaction`: merges L0 into L1 correctly; updated keys show the new value, deleted keys are gone
 - `TestSSTableFileCountBounded`: after 20 rounds of writes and flushes, total SSTable file count stays bounded
 
