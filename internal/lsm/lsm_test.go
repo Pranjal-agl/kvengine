@@ -345,3 +345,14 @@ func BenchmarkLSMGetLargeSSTable(b *testing.B) {
 		e.Get([]byte(fmt.Sprintf("k%07d", (i*7919)%100000)))
 	}
 }
+
+// BenchmarkLSMPutNoSync: WAL appended and handed to the OS, not fsynced.
+func BenchmarkLSMPutNoSync(b *testing.B) {
+	e, _ := OpenWithOptions(b.TempDir(), Options{NoSync: true})
+	defer e.Close()
+	key, val := []byte("benchkey"), []byte("benchvalue")
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		e.Put(key, val)
+	}
+}

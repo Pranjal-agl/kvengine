@@ -11,10 +11,14 @@
 // a key wins, *including* a tombstone: a delete in a newer layer must hide
 // any value in an older one.
 //
-// Durability: SSTables are written atomically (tmp → fsync → rename →
-// fsync dir) and reloaded by Open. The MemTable itself has no WAL yet, so
-// writes are durable only once flushed (Flush, Close, or a size-triggered
-// flush). See docs/ARCHITECTURE.md "LSM Engine".
+// Durability: every write is appended to a write-ahead log and fsynced
+// before it reaches the MemTable (Options.NoSync relaxes this), so an
+// acknowledged write survives a crash even before it is flushed. Each
+// MemTable generation has its own WAL file (wal-NNNNNN.log); once the
+// MemTable is safely in an SSTable, its WAL is deleted. SSTables are
+// written atomically (tmp → fsync → rename → fsync dir). Open reloads the
+// SSTables and replays any WALs left by a crash. See docs/ARCHITECTURE.md
+// "LSM Engine".
 package lsm
 
 import (
@@ -28,11 +32,13 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	"kvengine/internal/wal"
 )
 
 const (
-	memTableSizeLimit = 4 * 1024 * 1024 // 4 MiB before flush
-	maxL0Tables       = 4               // compact L0→L1 when L0 has this many SSTables
+	defaultMemTableSize = 4 * 1024 * 1024 // 4 MiB before flush
+	maxL0Tables         = 4               // compact L0→L1 when L0 has this many SSTables
 
 	// indexInterval: the sparse index records the file offset of every
 	// indexInterval-th entry. A lookup binary-searches the index, seeks to
@@ -276,16 +282,39 @@ func (sst *SSTable) readAll() ([]entry, error) {
 
 func (sst *SSTable) close() error { return sst.f.Close() }
 
+// Options configure an Engine. The zero value is the safe default.
+type Options struct {
+	// MemTableSize is the approximate MemTable size in bytes that triggers
+	// a flush to L0. Default 4 MiB.
+	MemTableSize int
+	// NoSync skips the per-write fsync of the WAL. Writes still reach the
+	// OS before returning, so they survive a process crash, but the most
+	// recent ones can be lost on power failure or kernel crash.
+	NoSync bool
+}
+
 // Engine is the top-level LSM storage engine. Safe for concurrent use.
+//
+// Locking: wmu serialises writers so WAL order equals MemTable order (the
+// same rule as internal/store: memory must never disagree with the log).
+// mu guards the in-memory structures; readers hold it only for lookups, so
+// they never wait on a writer's fsync. Lock order: wmu, then mu.
 type Engine struct {
+	wmu      sync.Mutex
 	mu       sync.RWMutex
 	dir      string
+	opts     Options
 	memtable *MemTable
 	l0       []*SSTable // Level 0: recently flushed, oldest first, may overlap
 	l1       []*SSTable // Level 1: output of the last compaction (0 or 1 file)
 	nextID   int
 	closed   bool
+
+	wal      *wal.WAL // WAL for the current MemTable
+	walFiles []string // WAL files whose contents are in the current MemTable
 }
+
+func walName(id int) string { return fmt.Sprintf("wal-%06d.log", id) }
 
 // Open opens the engine in dir, creating it if needed, and reloads any
 // SSTables left by a previous run.
@@ -295,11 +324,20 @@ type Engine struct {
 // and makes it visible (rename) before deleting the inputs. So if a crash
 // interrupts the deletions, any L0 or L1 file with an ID below the newest
 // L1's is a leftover input that has already been merged; Open deletes it.
-func Open(dir string) (*Engine, error) {
+//
+// WALs left by a crash are replayed in order into the MemTable, which is
+// then flushed so recovery starts from a clean slate.
+func Open(dir string) (*Engine, error) { return OpenWithOptions(dir, Options{}) }
+
+// OpenWithOptions is Open with explicit options.
+func OpenWithOptions(dir string, opts Options) (*Engine, error) {
+	if opts.MemTableSize <= 0 {
+		opts.MemTableSize = defaultMemTableSize
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("lsm: mkdir: %w", err)
 	}
-	e := &Engine{dir: dir, memtable: newMemTable()}
+	e := &Engine{dir: dir, opts: opts, memtable: newMemTable()}
 
 	names, err := os.ReadDir(dir)
 	if err != nil {
@@ -307,11 +345,20 @@ func Open(dir string) (*Engine, error) {
 	}
 	type found struct{ level, id int }
 	var files []found
+	var wals []int
 	newestL1 := -1
 	for _, d := range names {
 		name := d.Name()
 		if strings.HasSuffix(name, ".tmp") {
 			os.Remove(filepath.Join(dir, name)) // incomplete write from a crash
+			continue
+		}
+		var walID int
+		if n, _ := fmt.Sscanf(name, "wal-%d.log", &walID); n == 1 && walName(walID) == name {
+			wals = append(wals, walID)
+			if walID > e.nextID {
+				e.nextID = walID
+			}
 			continue
 		}
 		var level, id int
@@ -345,6 +392,28 @@ func Open(dir string) (*Engine, error) {
 			e.l0 = append(e.l0, sst)
 		}
 	}
+
+	// Replay WALs oldest first, so later writes win.
+	sort.Ints(wals)
+	for _, id := range wals {
+		path := filepath.Join(dir, walName(id))
+		recs, err := wal.Replay(path)
+		if err != nil {
+			e.closeTables()
+			return nil, fmt.Errorf("lsm: replay %s: %w", path, err)
+		}
+		for _, r := range recs {
+			en := entry{key: string(r.Key), value: string(r.Value), deleted: r.Type == wal.RecordDelete}
+			e.memtable.set(en)
+		}
+		e.walFiles = append(e.walFiles, path)
+	}
+	// Flush what was recovered (or, if nothing, just retire the old WALs
+	// and open a fresh one).
+	if err := e.flushLocked(); err != nil {
+		e.closeTables()
+		return nil, err
+	}
 	return e, nil
 }
 
@@ -360,13 +429,36 @@ func (e *Engine) Delete(key []byte) error {
 }
 
 func (e *Engine) write(en entry) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.closed {
+	e.wmu.Lock()
+	defer e.wmu.Unlock()
+	e.mu.RLock()
+	closed := e.closed
+	e.mu.RUnlock()
+	if closed {
 		return ErrClosed
 	}
+
+	// Write-ahead: the record is in the log (and, by default, on disk)
+	// before the MemTable — and therefore any reader — can see it.
+	rec := wal.Record{Type: wal.RecordPut, Key: []byte(en.key), Value: []byte(en.value)}
+	if en.deleted {
+		rec = wal.Record{Type: wal.RecordDelete, Key: []byte(en.key)}
+	}
+	if err := e.wal.Append(rec); err != nil {
+		return fmt.Errorf("lsm: wal append: %w", err)
+	}
+	sync := e.wal.Sync
+	if e.opts.NoSync {
+		sync = e.wal.Flush
+	}
+	if err := sync(); err != nil {
+		return fmt.Errorf("lsm: wal sync: %w", err)
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	e.memtable.set(en)
-	if e.memtable.size < memTableSizeLimit {
+	if e.memtable.size < e.opts.MemTableSize {
 		return nil
 	}
 	return e.flushLocked()
@@ -419,22 +511,55 @@ func result(en entry) ([]byte, bool, error) {
 	return []byte(en.value), true, nil
 }
 
-// flushLocked writes the MemTable to a new L0 SSTable and compacts if L0
-// is full. Called with e.mu held.
+// flushLocked writes the MemTable to a new L0 SSTable, switches to a new
+// WAL, deletes the WAL(s) the SSTable now covers, and compacts if L0 is
+// full. Called with wmu and mu held (or during Open).
+//
+// The SSTable is durable before any WAL is deleted, so a crash at any
+// point leaves every write in at least one of them. A WAL that survives
+// alongside its SSTable is replayed on Open; that only re-applies values
+// the SSTable already has, in order, which is harmless.
 func (e *Engine) flushLocked() error {
-	if len(e.memtable.data) == 0 {
-		return nil
+	flushed := false
+	if len(e.memtable.data) > 0 {
+		e.nextID++
+		sst, err := writeSSTable(e.dir, 0, e.nextID, e.memtable.sorted())
+		if err != nil {
+			return err
+		}
+		e.l0 = append(e.l0, sst)
+		e.memtable = newMemTable()
+		flushed = true
 	}
-	e.nextID++
-	sst, err := writeSSTable(e.dir, 0, e.nextID, e.memtable.sorted())
-	if err != nil {
-		return err
+	// A new WAL is needed after a flush, on first open, and after
+	// recovery (when several old WALs fed the MemTable).
+	if flushed || e.wal == nil || len(e.walFiles) != 1 {
+		if err := e.rotateWAL(); err != nil {
+			return err
+		}
 	}
-	e.l0 = append(e.l0, sst)
-	e.memtable = newMemTable()
 	if len(e.l0) >= maxL0Tables {
 		return e.compact()
 	}
+	return nil
+}
+
+// rotateWAL opens a fresh WAL for the (now empty) MemTable and deletes the
+// WAL files whose contents have been flushed.
+func (e *Engine) rotateWAL() error {
+	e.nextID++
+	path := filepath.Join(e.dir, walName(e.nextID))
+	w, err := wal.Open(path)
+	if err != nil {
+		return fmt.Errorf("lsm: open wal: %w", err)
+	}
+	if e.wal != nil {
+		e.wal.Close()
+	}
+	for _, old := range e.walFiles {
+		os.Remove(old)
+	}
+	e.wal, e.walFiles = w, []string{path}
 	return nil
 }
 
@@ -482,16 +607,23 @@ func (e *Engine) compact() error {
 
 // Flush forces the current MemTable to disk immediately, regardless of size.
 func (e *Engine) Flush() error {
+	e.wmu.Lock()
+	defer e.wmu.Unlock()
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.closed {
 		return ErrClosed
+	}
+	if len(e.memtable.data) == 0 {
+		return nil
 	}
 	return e.flushLocked()
 }
 
 // Close flushes the MemTable and releases all open files.
 func (e *Engine) Close() error {
+	e.wmu.Lock()
+	defer e.wmu.Unlock()
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.closed {
@@ -500,6 +632,14 @@ func (e *Engine) Close() error {
 	err := e.flushLocked()
 	e.closed = true
 	e.closeTables()
+	if e.wal != nil {
+		e.wal.Close()
+		if err == nil {
+			for _, f := range e.walFiles {
+				os.Remove(f) // empty after the final flush
+			}
+		}
+	}
 	return err
 }
 

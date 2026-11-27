@@ -240,6 +240,18 @@ func (w *WAL) Sync() error {
 	return nil
 }
 
+// Flush hands buffered records to the OS without fsyncing. They survive
+// a process crash but not a power failure, and are not yet streamable to
+// replication followers (durableOff only advances on Sync).
+func (w *WAL) Flush() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if err := w.w.Flush(); err != nil {
+		return fmt.Errorf("wal: flush: %w", err)
+	}
+	return nil
+}
+
 // DurableOffset returns the byte position of the end of the most recently
 // fsynced record — the safe upper bound for replication streaming.
 func (w *WAL) DurableOffset() int64 {
