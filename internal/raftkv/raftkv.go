@@ -61,6 +61,10 @@ type Options struct {
 	// ReadTimeout bounds how long a linearizable read waits to confirm
 	// leadership and catch up. Default 2s.
 	ReadTimeout time.Duration
+	// CatchUpTimeout bounds how long AddNode replicates to a new node, as a
+	// non-voting learner, before giving up on it. Default
+	// raft.DefaultCatchUpTimeout (2 minutes).
+	CatchUpTimeout time.Duration
 	// StaleReads serves GetErr straight from the local state machine,
 	// skipping the read index: faster, but may return stale data.
 	StaleReads bool
@@ -143,6 +147,9 @@ func New(node *raft.Node, applyCh <-chan raft.ApplyMsg, opts Options) (*KV, erro
 	}
 	if opts.ReadTimeout <= 0 {
 		opts.ReadTimeout = 2 * time.Second
+	}
+	if opts.CatchUpTimeout <= 0 {
+		opts.CatchUpTimeout = raft.DefaultCatchUpTimeout
 	}
 	if opts.Logger == nil {
 		opts.Logger = log.Default()
@@ -377,10 +384,16 @@ func (kv *KV) failAll(err error) {
 
 // AddNode adds a voting member (id reachable at its Raft address addr)
 // and waits for the change to commit. The new server should already be
-// running with an empty membership (kvengine raft --join) so it can be
-// caught up. Only one change can be in flight at a time.
+// running with an empty membership (kvengine raft --join). The leader
+// first replicates the log to it as a non-voting learner and only adds it
+// once it has caught up, so commits never wait on a newcomer; if it doesn't
+// catch up within Options.CatchUpTimeout, AddNode returns
+// raft.ErrCatchUpTimeout and membership is unchanged. Only one change can
+// be in flight at a time.
 func (kv *KV) AddNode(id, addr string) error {
-	return kv.changeMembership(func() (uint64, uint64, error) { return kv.node.AddServer(id, addr) })
+	return kv.changeMembership(func() (uint64, uint64, error) {
+		return kv.node.AddServerTimeout(id, addr, kv.opts.CatchUpTimeout)
+	})
 }
 
 // RemoveNode removes a member and waits for the change to commit. Removing

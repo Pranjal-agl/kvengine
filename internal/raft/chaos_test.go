@@ -119,7 +119,7 @@ func chaosRun(t *testing.T, seed int64) {
 			next++
 			c.start(id, Membership{})
 			all = append(all, id)
-			tryChange(func(l *Node) (uint64, uint64, error) { return l.AddServer(id, "") })
+			tryChange(func(l *Node) (uint64, uint64, error) { return l.AddServerTimeout(id, "", 500*time.Millisecond) })
 		case 7: // remove a random member, keeping at least 3
 			c.mu.Lock()
 			var l *Node

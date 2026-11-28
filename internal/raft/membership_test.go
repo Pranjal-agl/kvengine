@@ -288,11 +288,20 @@ func TestOneMembershipChangeAtATime(t *testing.T) {
 			c.tr.Partition(lid, id)
 		}
 	}
-	if _, _, err := l.AddServer("m9", ""); err != nil {
+	// (A removal, not an addition: AddServer would wait for the new
+	// server to catch up, which it can't while the leader is cut off.)
+	victim := "m1"
+	if lid == "m1" {
+		victim = "m2"
+	}
+	if _, _, err := l.RemoveServer(victim); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := l.AddServer("m10", ""); !errors.Is(err, ErrConfigChangeInProgress) {
+	if _, _, err := l.AddServerTimeout("m10", "", time.Second); !errors.Is(err, ErrConfigChangeInProgress) {
 		t.Fatalf("second concurrent change: got %v, want ErrConfigChangeInProgress", err)
+	}
+	if _, _, err := l.RemoveServer(lid); !errors.Is(err, ErrConfigChangeInProgress) {
+		t.Fatalf("third concurrent change: got %v, want ErrConfigChangeInProgress", err)
 	}
 }
 

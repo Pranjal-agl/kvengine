@@ -131,6 +131,7 @@ go test -race -v -timeout 60s ./internal/raft/...
 - `TestTCPTransportReusesConnections`, `TestTCPTransportRetriesStaleConnection`, `TestTCPTransportCloseStopsExistingConnections`: connection pooling, transparent retry after a peer restart, and a closed transport going silent
 - `TestAddServer`, `TestRemoveFollower`, `TestRemoveLeader`, `TestOneMembershipChangeAtATime`: membership changes, including that a removed node can't disrupt the cluster and a removed leader steps down only once its removal commits
 - `TestUncommittedConfigRevertsOnTruncation`, `TestMembershipSurvivesSnapshotsAndRestart`, `TestRequestVoteIgnoredWhileLeaderAlive`, `TestEvenSplitHasNoQuorum`, `TestReadIndexSkipsConfigEntries`
+- `TestAddUnreachableServerDoesNotStallCluster`, `TestAddServerWaitsUntilCaughtUp`, `TestAddServerFailsWhenLeaderChanges`: AddServer catches a new server up as a non-voting learner first; one that never catches up is dropped with membership unchanged, and the cluster keeps committing meanwhile
 - `TestLeaderWithoutQuorumStepsDown`: a leader that reaches only a minority steps down (CheckQuorum) so the majority can elect a new one
 - `TestMembershipChaos`: random membership changes, partitions, crashes and restarts under load; Election Safety checked continuously, State Machine Safety at the end
 - `TestCodecRoundTrip`, `TestCodecRejectsTruncationAndTrailingBytes`, `FuzzDecodeRPC`, `TestTCPTransportAnswersLegacyJSON`, `TestTCPTransportFallsBackToJSONForOldPeers`: the binary codec and rolling-upgrade compatibility
@@ -204,6 +205,7 @@ bash scripts/e2e/run.sh failover membership   # some of them
 | `clean_shutdown` | SIGINT and SIGTERM exit 0 promptly and log `shutdown complete`; data is intact afterwards |
 | `follower_reads` | Linearizable follower reads see each write acknowledged just before them; with the leader frozen (SIGSTOP) they fail within the read timeout, while `--stale-reads` still answers |
 | `membership` | `--join` + `ADDNODE`, kill the leader, `REMOVENODE` it, add another node, then restart every node with no `--peers` at all (membership comes from disk) |
+| `add_unreachable` | `ADDNODE` of a node that never answers fails after `--catch-up-timeout`; the one-node cluster keeps committing (it used to stall) |
 | `crash_under_load` | SIGKILL all three nodes during an 8-writer load; after restart every acknowledged write is present |
 | `single_node` | Single-node CLI and server mode across restarts |
 | `migrate` | A cluster written by v1.0 is stopped and restarted on the new binary with its data, including keys like `user` that are valid base64 |

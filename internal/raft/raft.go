@@ -195,6 +195,9 @@ type Node struct {
 	nextIndex        map[string]uint64
 	matchIndex       map[string]uint64
 	snapshotInFlight map[string]bool
+	// learners: servers AddServer is catching up before they become
+	// members. They get the log but count toward no majority.
+	learners map[string]bool
 
 	// ReadIndex support. Every AppendEntries/InstallSnapshot carries the
 	// value of hbRound when it was built; ackRound[peer] is the highest
@@ -490,6 +493,7 @@ func (n *Node) becomeLeader() {
 	n.snapshotInFlight = make(map[string]bool, len(n.peers))
 	n.ackRound = make(map[string]uint64, len(n.peers))
 	n.lastAck = make(map[string]time.Time, len(n.peers))
+	n.learners = map[string]bool{}
 	n.leaderSince = time.Now()
 	n.readRoundOn, n.readsQueued = false, false
 	n.signal()
@@ -538,6 +542,9 @@ func (n *Node) heartbeatLoop() {
 func (n *Node) broadcastAppendEntries() {
 	for _, peer := range n.peers {
 		n.sendAppendEntries(peer)
+	}
+	for l := range n.learners {
+		n.sendAppendEntries(l)
 	}
 }
 
@@ -599,7 +606,7 @@ func (n *Node) sendAppendEntries(peer string) {
 			n.becomeFollower(reply.Term)
 			return
 		}
-		if n.role != Leader || n.currentTerm != term || !n.isMember(peer) {
+		if n.role != Leader || n.currentTerm != term || !n.replicatesTo(peer) {
 			return // stale reply, or the peer was removed meanwhile
 		}
 		// Success or not, the peer accepted us as leader for this term.
@@ -612,6 +619,9 @@ func (n *Node) sendAppendEntries(peer string) {
 			}
 			n.nextIndex[peer] = n.matchIndex[peer] + 1
 			n.maybeAdvanceCommitIndex()
+			if n.learners[peer] {
+				n.signal() // AddServer is watching its progress
+			}
 			return
 		}
 		// Fast backup: use conflict hints to jump nextIndex to the right
@@ -685,7 +695,7 @@ func (n *Node) sendInstallSnapshot(peer string) {
 			n.becomeFollower(reply.Term)
 			return
 		}
-		if n.role != Leader || n.currentTerm != term || !n.isMember(peer) {
+		if n.role != Leader || n.currentTerm != term || !n.replicatesTo(peer) {
 			return
 		}
 		n.recordAck(peer, round)
@@ -694,6 +704,9 @@ func (n *Node) sendInstallSnapshot(peer string) {
 		}
 		n.nextIndex[peer] = n.matchIndex[peer] + 1
 		n.maybeAdvanceCommitIndex()
+		if n.learners[peer] {
+			n.signal()
+		}
 		n.sendAppendEntries(peer) // follow up with any entries after the snapshot
 	}()
 }

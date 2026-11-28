@@ -274,6 +274,35 @@ def membership(binary, old):
     c.cleanup()
 
 
+@scenario()
+def add_unreachable(binary, old):
+    """ADDNODE for a node that never answers fails after --catch-up-timeout
+    and leaves the cluster as it was. It used to add the node at once: a
+    one-node cluster then needed two votes and stopped committing."""
+    c = Cluster(binary, ["n0"])
+    try:
+        c.start_all(extra=["--catch-up-timeout", "1s"])
+        c.put("before", "1")
+        from kvcluster import free_port
+        ghost = "127.0.0.1:%d" % free_port()
+        t0 = time.monotonic()
+        with c["n0"].client(timeout=10) as cl:
+            try:
+                cl.admin("ADDNODE", "ghost", ghost)
+                raise AssertionError("ADDNODE of an unreachable node succeeded")
+            except KVError as e:
+                print("    refused after %.1fs: %s" % (time.monotonic() - t0, e))
+                assert "catch up" in str(e), e
+        _assert_members(c["n0"], {"n0"})
+        with c["n0"].client(timeout=3) as cl:
+            cl.put("after", "2")  # still commits on its own
+            assert cl.get("before") == b"1"
+    except BaseException:
+        c.cleanup(failed=True)
+        raise
+    c.cleanup()
+
+
 def _assert_members(node, want):
     got, _ = node.members()
     assert set(got) == set(want), "members %s, want %s" % (sorted(got), sorted(want))
