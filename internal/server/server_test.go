@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"net"
 	"path/filepath"
 	"sync"
@@ -367,5 +368,82 @@ func TestGetUsesGetErr(t *testing.T) {
 		if line != tc.want {
 			t.Errorf("err=%v: got %q, want %q", tc.err, line, tc.want)
 		}
+	}
+}
+
+type fakeAdmin struct {
+	KVStore
+	added, removed []string
+}
+
+func (f *fakeAdmin) AddNode(id, addr string) error {
+	f.added = append(f.added, id+"@"+addr)
+	return nil
+}
+func (f *fakeAdmin) RemoveNode(id string) error {
+	if id == "bad" {
+		return fmt.Errorf("no such member")
+	}
+	f.removed = append(f.removed, id)
+	return nil
+}
+func (f *fakeAdmin) MembersInfo() string { return "n0 a:1 leader\nn1 a:2\n" }
+
+func TestAdminCommands(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "s.wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	fa := &fakeAdmin{KVStore: s}
+	srv := New(fa)
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	go srv.Serve(ln)
+	defer srv.Close()
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	r := bufio.NewReader(conn)
+	send := func(cmd string) string {
+		fmt.Fprint(conn, cmd)
+		line, _ := r.ReadString('\n')
+		return line
+	}
+	if got := send("ADDNODE n2 10.0.0.3:7000\r\n"); got != "+OK\r\n" {
+		t.Fatalf("ADDNODE: %q", got)
+	}
+	if got := send("REMOVENODE bad\r\n"); got != "-ERR removenode failed: no such member\r\n" {
+		t.Fatalf("REMOVENODE bad: %q", got)
+	}
+	if got := send("ADDNODE onlyid\r\n"); got[:4] != "-ERR" {
+		t.Fatalf("bad ADDNODE args: %q", got)
+	}
+	if got := send("MEMBERS\r\n"); got != "$21\r\n" {
+		t.Fatalf("MEMBERS header: %q", got)
+	}
+	body := make([]byte, 23)
+	io.ReadFull(r, body)
+	if string(body) != "n0 a:1 leader\nn1 a:2\n\r\n" {
+		t.Fatalf("MEMBERS body: %q", body)
+	}
+	if len(fa.added) != 1 || fa.added[0] != "n2@10.0.0.3:7000" {
+		t.Fatalf("added = %v", fa.added)
+	}
+}
+
+// Without Raft, admin commands are refused cleanly.
+func TestAdminCommandsWithoutRaft(t *testing.T) {
+	_, addr := startTestServer(t)
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	fmt.Fprint(conn, "MEMBERS\r\n")
+	line, _ := bufio.NewReader(conn).ReadString('\n')
+	if line[:4] != "-ERR" {
+		t.Fatalf("got %q", line)
 	}
 }

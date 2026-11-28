@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -260,4 +261,68 @@ func TestLaggingFollowerCatchesUpWithSnapshot(t *testing.T) {
 	}
 	c.transport.HealAll()
 	waitFor(t, "lagging follower to catch up", func() bool { return c.kvs[lag].Len() == 30 })
+}
+
+// Growing a running cluster through the KV layer: a joining node catches
+// up on existing data, then counts toward the majority.
+func TestAddAndRemoveNode(t *testing.T) {
+	c := newTestCluster(t, 3, Options{SnapshotEvery: 5})
+	l := c.leader()
+	for i := 0; i < 12; i++ {
+		if err := c.kvs[l].Put([]byte(fmt.Sprintf("k%d", i)), []byte("v")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Start a fourth node with no membership: it waits to be added.
+	c.ids = append(c.ids, "n3")
+	c.nodes = append(c.nodes, nil)
+	c.kvs = append(c.kvs, nil)
+	ch := make(chan raft.ApplyMsg, 256)
+	node, err := raft.NewNodeWithMembers("n3", raft.Membership{}, c.transport, ch,
+		filepath.Join(c.dir, "n3-state.json"), filepath.Join(c.dir, "n3-snap.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	kv, err := New(node, ch, c.opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.nodes[3], c.kvs[3] = node, kv
+
+	if err := c.kvs[(l+1)%3].AddNode("n3", ""); err == nil {
+		t.Fatal("AddNode on a follower should fail with NotLeaderError")
+	}
+	if err := c.kvs[l].AddNode("n3", ""); err != nil {
+		t.Fatalf("AddNode: %v", err)
+	}
+	// It catches up on data written before it joined (via snapshot).
+	waitFor(t, "new node to catch up", func() bool {
+		v, ok, err := c.kvs[3].GetErr([]byte("k11"))
+		return err == nil && ok && string(v) == "v"
+	})
+	if info := c.kvs[l].MembersInfo(); !strings.Contains(info, "n3") || strings.Count(info, "\n") != 4 {
+		t.Fatalf("MembersInfo = %q", info)
+	}
+
+	// Remove the original leader; the cluster keeps working without it.
+	if err := c.kvs[l].RemoveNode(c.ids[l]); err != nil {
+		t.Fatalf("RemoveNode(leader): %v", err)
+	}
+	var nl int
+	waitFor(t, "new leader among remaining members", func() bool {
+		for i, n := range c.nodes {
+			if i != l && n.State().Role == raft.Leader {
+				nl = i
+				return true
+			}
+		}
+		return false
+	})
+	if err := c.kvs[nl].Put([]byte("after"), []byte("ok")); err != nil {
+		t.Fatalf("write after removing the old leader: %v", err)
+	}
+	waitFor(t, "new node sees post-removal write", func() bool {
+		v, ok, err := c.kvs[3].GetErr([]byte("after"))
+		return err == nil && ok && string(v) == "ok"
+	})
 }

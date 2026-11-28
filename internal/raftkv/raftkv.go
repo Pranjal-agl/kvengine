@@ -341,6 +341,56 @@ func (kv *KV) failAll(err error) {
 	}
 }
 
+// AddNode adds a voting member (id reachable at its Raft address addr)
+// and waits for the change to commit. The new server should already be
+// running with an empty membership (kvengine raft --join) so it can be
+// caught up. Only one change can be in flight at a time.
+func (kv *KV) AddNode(id, addr string) error {
+	return kv.changeMembership(func() (uint64, uint64, error) { return kv.node.AddServer(id, addr) })
+}
+
+// RemoveNode removes a member and waits for the change to commit. Removing
+// the current leader is allowed: it hands off by stepping down once the
+// change commits.
+func (kv *KV) RemoveNode(id string) error {
+	return kv.changeMembership(func() (uint64, uint64, error) { return kv.node.RemoveServer(id) })
+}
+
+func (kv *KV) changeMembership(propose func() (uint64, uint64, error)) error {
+	idx, term, err := propose()
+	if err != nil {
+		var nle *raft.NotLeaderError
+		if errors.As(err, &nle) {
+			return &NotLeaderError{LeaderID: nle.LeaderId}
+		}
+		return err
+	}
+	switch err := kv.node.WaitCommitted(idx, term, kv.opts.WriteTimeout); {
+	case errors.Is(err, raft.ErrLost):
+		return ErrLost
+	case errors.Is(err, raft.ErrCommitTimeout):
+		return ErrTimeout
+	default:
+		return err
+	}
+}
+
+// MembersInfo describes the current membership, one "id addr" line per
+// member with the leader marked, for the MEMBERS command.
+func (kv *KV) MembersInfo() string {
+	m := kv.node.Members()
+	leader := kv.node.State().LeaderId
+	var out string
+	for _, id := range m.IDs() {
+		line := id + " " + m[id]
+		if id == leader {
+			line += " leader"
+		}
+		out += line + "\n"
+	}
+	return out
+}
+
 // Applied returns the index of the last entry applied to the state machine.
 func (kv *KV) Applied() uint64 {
 	kv.mu.Lock()

@@ -16,7 +16,11 @@
 //	              --peers <id=host:raftport,id=host:raftport,...> \
 //	              --raft-addr <host:raftport> \
 //	              --kv-addr <host:kvport> \
-//	              --data-dir <dir> [--snapshot-every N] [--stale-reads]
+//	              --data-dir <dir> [--snapshot-every N] [--stale-reads] [--join]
+//
+//	# Grow or shrink a running cluster (send to any node; it must reach the leader):
+//	#   start the new node with --join, then on the leader:
+//	ADDNODE <id> <raftAddr>      REMOVENODE <id>      MEMBERS
 //	  e.g. (node 0 of 3):
 //	    kvengine raft --id node0 \
 //	      --peers "node1=127.0.0.1:7001,node2=127.0.0.1:7002" \
@@ -150,6 +154,7 @@ func runRaft(args []string) {
 	dataDir := fs.String("data-dir", ".", "directory for Raft state and snapshots")
 	snapEvery := fs.Int("snapshot-every", 1000, "take a Raft snapshot after this many applied writes (0 = never)")
 	staleReads := fs.Bool("stale-reads", false, "serve GETs from local state without a read index (faster, may be stale)")
+	join := fs.Bool("join", false, "start empty and wait to be added to an existing cluster (ADDNODE on its leader); --peers is not needed")
 	fs.Parse(args)
 
 	if *id == "" || *raftAddr == "" {
@@ -164,7 +169,6 @@ func runRaft(args []string) {
 
 	// Parse peers: "node1=127.0.0.1:7001,node2=127.0.0.1:7002"
 	addrs := map[string]string{*id: *raftAddr}
-	var peerIDs []string
 	if *peersRaw != "" {
 		for _, pair := range strings.Split(*peersRaw, ",") {
 			parts := strings.SplitN(strings.TrimSpace(pair), "=", 2)
@@ -175,7 +179,6 @@ func runRaft(args []string) {
 				fatal("bad peer spec:", fmt.Errorf("--peers must not include this node (%s)", *id))
 			}
 			addrs[parts[0]] = parts[1]
-			peerIDs = append(peerIDs, parts[0])
 		}
 	}
 
@@ -183,7 +186,16 @@ func runRaft(args []string) {
 	// source of truth; the key-value state is rebuilt from them on start.
 	transport := raft.NewTCPTransport(addrs)
 	applyCh := make(chan raft.ApplyMsg, 256)
-	node, err := raft.NewNode(*id, peerIDs, transport, applyCh,
+	// Bootstrap membership: this node plus --peers. Only used until the node
+	// has a snapshot or a membership entry in its log; a joining node
+	// starts with none and learns it from the leader.
+	members := raft.Membership{}
+	if !*join {
+		for nid, addr := range addrs {
+			members[nid] = addr
+		}
+	}
+	node, err := raft.NewNodeWithMembers(*id, members, transport, applyCh,
 		filepath.Join(*dataDir, "raft-state.json"),
 		filepath.Join(*dataDir, "raft-snap.json"))
 	if err != nil {
@@ -252,6 +264,10 @@ Raft cluster node:
 
   GETs are linearizable on every node by default (ReadIndex);
   --stale-reads serves them from local state instead.
+
+  Membership changes (one at a time, sent to the leader's KV port):
+    start the new node with --join (no --peers needed), then
+    ADDNODE <id> <raftAddr> | REMOVENODE <id> | MEMBERS
 
   Example — 3-node cluster on localhost:
     Terminal 1: kvengine raft --id n0 --raft-addr :7000 --kv-addr :6380 \

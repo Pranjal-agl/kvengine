@@ -48,6 +48,18 @@ type ErrGetter interface {
 	GetErr(key []byte) ([]byte, bool, error)
 }
 
+// Admin is implemented by stores that support cluster membership changes
+// (the Raft-backed store). When present, the server accepts:
+//
+//	ADDNODE <id> <raftAddr>\r\n  ->  +OK\r\n
+//	REMOVENODE <id>\r\n          ->  +OK\r\n
+//	MEMBERS\r\n                   ->  $<len>\r\n<"id addr [leader]" lines>\r\n
+type Admin interface {
+	AddNode(id, addr string) error
+	RemoveNode(id string) error
+	MembersInfo() string
+}
+
 // Server serves the kvengine protocol over TCP, backed by a KVStore.
 type Server struct {
 	store KVStore
@@ -197,6 +209,8 @@ func (srv *Server) handleConn(conn net.Conn) {
 			srv.handleGet(w, fields)
 		case "DEL":
 			srv.handleDel(w, fields)
+		case "ADDNODE", "REMOVENODE", "MEMBERS":
+			srv.handleAdmin(w, cmd, fields)
 		default:
 			writeErr(w, fmt.Errorf("unknown command %q", cmd))
 		}
@@ -322,6 +336,33 @@ func (srv *Server) handleDel(w *bufio.Writer, fields []string) {
 	}
 	if err := srv.store.Delete([]byte(fields[1])); err != nil {
 		writeErr(w, fmt.Errorf("delete failed: %w", err))
+		return
+	}
+	fmt.Fprint(w, "+OK\r\n")
+}
+
+func (srv *Server) handleAdmin(w *bufio.Writer, cmd string, fields []string) {
+	admin, ok := srv.store.(Admin)
+	if !ok {
+		writeErr(w, fmt.Errorf("%s not supported: this server is not running in Raft mode", cmd))
+		return
+	}
+	var err error
+	switch {
+	case cmd == "ADDNODE" && len(fields) == 3:
+		err = admin.AddNode(fields[1], fields[2])
+	case cmd == "REMOVENODE" && len(fields) == 2:
+		err = admin.RemoveNode(fields[1])
+	case cmd == "MEMBERS" && len(fields) == 1:
+		info := admin.MembersInfo()
+		fmt.Fprintf(w, "$%d\r\n%s\r\n", len(info), info)
+		return
+	default:
+		writeErr(w, fmt.Errorf("usage: ADDNODE <id> <raftAddr> | REMOVENODE <id> | MEMBERS"))
+		return
+	}
+	if err != nil {
+		writeErr(w, fmt.Errorf("%s failed: %w", strings.ToLower(cmd), err))
 		return
 	}
 	fmt.Fprint(w, "+OK\r\n")
