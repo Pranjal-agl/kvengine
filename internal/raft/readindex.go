@@ -56,8 +56,8 @@ const readIndexRPCTimeout = 2 * electionTimeoutMax
 
 // ReadIndex returns an index such that, once the caller's state machine has
 // applied it, a local read is linearizable. The index is always one that
-// is delivered on applyCh (or a snapshot index), never a leader no-op, so
-// it is safe to wait for it by watching applyCh. On the leader this confirms
+// is delivered on applyCh (or a snapshot index), never a leader no-op or
+// membership entry, so it is safe to wait for it by watching applyCh. On the leader this confirms
 // leadership with a quorum; on a follower it asks the leader.
 func (n *Node) ReadIndex(timeout time.Duration) (uint64, error) {
 	deadline := time.Now().Add(timeout)
@@ -111,12 +111,12 @@ func (n *Node) leaderReadIndex(deadline time.Time) (uint64, error) {
 			return 0, err
 		}
 	}
-	// No-ops (nil Command) don't change state and are never delivered on
-	// applyCh, so a caller tracking progress from applyCh would wait
-	// forever for one. Step back to the last real command: the state there
-	// is identical.
+	// Leader no-ops and membership entries don't change the state machine
+	// and are never delivered on applyCh, so a caller tracking progress
+	// from applyCh would wait forever for one. Step back to the last entry
+	// that is delivered: the state there is identical.
 	readIdx := n.commitIndex
-	for readIdx > n.snapshotIndex && n.entryAt(readIdx).Command == nil {
+	for readIdx > n.snapshotIndex && !n.entryAt(readIdx).delivered() {
 		readIdx--
 	}
 
@@ -166,13 +166,7 @@ func (n *Node) advanceReadRound() {
 }
 
 func (n *Node) quorumAcked(round uint64) bool {
-	count := 1 // self
-	for _, p := range n.peers {
-		if n.ackRound[p] >= round {
-			count++
-		}
-	}
-	return count*2 > len(n.peers)+1
+	return n.hasQuorum(func(id string) bool { return id == n.id || n.ackRound[id] >= round })
 }
 
 // waitChange releases mu until n.changed fires, the deadline passes, or

@@ -113,6 +113,21 @@ func NewTCPTransport(addrs map[string]string) *TCPTransport {
 	}
 }
 
+// SetPeerAddrs records addresses for cluster members, so the transport can
+// reach servers added after it was created (membership changes). Empty
+// addresses are ignored, and existing entries are never removed: a member
+// that was removed may still need to be reached briefly (e.g. to learn of
+// a newer term).
+func (t *TCPTransport) SetPeerAddrs(m Membership) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for id, addr := range m {
+		if addr != "" {
+			t.addrs[id] = addr
+		}
+	}
+}
+
 func (t *TCPTransport) Register(id string, node *Node) {
 	t.mu.Lock()
 	t.node = node
@@ -122,7 +137,9 @@ func (t *TCPTransport) Register(id string, node *Node) {
 // Serve binds the listener for id and starts accepting RPC connections.
 // Blocks until the listener is closed; call Close() to stop.
 func (t *TCPTransport) Serve(id string) error {
+	t.mu.RLock()
 	addr, ok := t.addrs[id]
+	t.mu.RUnlock()
 	if !ok {
 		return fmt.Errorf("tcp transport: no address for %s", id)
 	}

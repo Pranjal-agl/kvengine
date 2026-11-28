@@ -187,3 +187,24 @@ func TestConcurrentReadsShareRounds(t *testing.T) {
 	}
 	t.Logf("%d concurrent reads used %d confirmation rounds", reads, rounds)
 }
+
+// After a membership change the newest committed entry is a config entry,
+// which (like a no-op) is never delivered on applyCh. The read index must
+// skip it, or every linearizable read would hang until the next write.
+func TestReadIndexSkipsConfigEntries(t *testing.T) {
+	c := newMCluster(t, 3, "")
+	c.propose("w")
+	c.start("m3", Membership{})
+	c.change(func(l *Node) (uint64, uint64, error) { return l.AddServer("m3", "") })
+	_, l := c.leader()
+	idx, err := l.ReadIndex(time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.mu.Lock()
+	e := l.entryAt(idx)
+	l.mu.Unlock()
+	if !e.delivered() {
+		t.Fatalf("read index %d points at an undelivered entry (kind %d)", idx, e.Kind)
+	}
+}

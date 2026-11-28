@@ -19,6 +19,9 @@ type Snapshot struct {
 	LastIncludedIndex uint64          `json:"last_included_index"`
 	LastIncludedTerm  uint64          `json:"last_included_term"`
 	Data              json.RawMessage `json:"data"` // opaque state machine bytes (must be valid JSON)
+	// Config is the cluster membership as of LastIncludedIndex. Nil in
+	// snapshots written before membership changes existed.
+	Config Membership `json:"config,omitempty"`
 }
 
 // TakeSnapshot compacts the log up to (and including) upToIndex.
@@ -46,10 +49,12 @@ func (n *Node) TakeSnapshot(upToIndex uint64, stateMachineData []byte) error {
 	}
 
 	lastTerm := n.termAt(upToIndex)
+	cfg, _ := n.configAt(upToIndex)
 	snap := Snapshot{
 		LastIncludedIndex: upToIndex,
 		LastIncludedTerm:  lastTerm,
 		Data:              json.RawMessage(stateMachineData),
+		Config:            cfg.clone(),
 	}
 	// Snapshot first, then the truncated log: if we crash in between, the
 	// old log still covers everything (see restoreState).
@@ -64,6 +69,10 @@ func (n *Node) TakeSnapshot(upToIndex uint64, stateMachineData []byte) error {
 	n.snapshotIndex = upToIndex
 	n.snapshotTerm = lastTerm
 	n.snapshotData = stateMachineData
+	n.baseConfig = cfg.clone()
+	if n.configIndex < upToIndex {
+		n.configIndex = upToIndex // the config entry was compacted into the base
+	}
 	n.rewriteLog()
 	return nil
 }
@@ -78,7 +87,7 @@ func (n *Node) LatestSnapshot() (*Snapshot, error) {
 		if n.snapshotIndex == 0 {
 			return nil, nil
 		}
-		return &Snapshot{n.snapshotIndex, n.snapshotTerm, json.RawMessage(n.snapshotData)}, nil
+		return &Snapshot{n.snapshotIndex, n.snapshotTerm, json.RawMessage(n.snapshotData), n.baseConfig.clone()}, nil
 	}
 	n.mu.Unlock()
 

@@ -59,9 +59,15 @@ func (r Role) String() string {
 // the client command (arbitrary bytes). log[0] is always a dummy sentinel
 // with Term=0 and Command=nil so that real entries start at index 1 and
 // "PrevLogIndex=0" always has a valid corresponding term.
+// delivered reports whether the entry is sent to the state machine on
+// applyCh. Leader no-ops (nil Command) and membership entries are not.
+// ReadIndex relies on this being the single definition.
+func (e LogEntry) delivered() bool { return e.Kind == EntryCommand && e.Command != nil }
+
 type LogEntry struct {
 	Term    uint64
 	Command []byte
+	Kind    EntryKind `json:",omitempty"` // EntryCommand or EntryConfig
 }
 
 // ApplyMsg is sent to applyCh when a log entry is committed by a quorum
@@ -120,6 +126,7 @@ type InstallSnapshotArgs struct {
 	LastIncludedIndex uint64
 	LastIncludedTerm  uint64
 	Data              []byte
+	Config            Membership // membership as of LastIncludedIndex
 }
 type InstallSnapshotReply struct {
 	Term uint64
@@ -143,7 +150,19 @@ type AppendEntriesReply struct {
 type Node struct {
 	mu    sync.Mutex
 	id    string
-	peers []string
+	peers []string // current members other than this node (derived from config)
+
+	// Membership (membership.go). config is the latest configuration in
+	// the log (committed or not); configIndex is the index of the entry
+	// that set it (or snapshotIndex if it is the base). baseConfig is the
+	// configuration in effect at snapshotIndex.
+	config      Membership
+	configIndex uint64
+	baseConfig  Membership
+
+	// lastLeaderContact is when we last heard from a valid leader; used to
+	// ignore disruptive RequestVotes (§4.2.3).
+	lastLeaderContact time.Time
 
 	// statePath: file for durable Raft state. "" = no persistence (tests).
 	statePath    string
@@ -221,13 +240,33 @@ type Node struct {
 // LatestSnapshot() before consuming applyCh: the first command delivered
 // after a restart is at index snapshotIndex+1.
 func NewNode(id string, peers []string, transport Transport, applyCh chan ApplyMsg, statePath string, snapshotPath ...string) (*Node, error) {
+	members := Membership{id: ""}
+	for _, p := range peers {
+		members[p] = ""
+	}
+	return NewNodeWithMembers(id, members, transport, applyCh, statePath, snapshotPath...)
+}
+
+// NewNodeWithMembers creates a node whose bootstrap configuration is
+// members (ID → transport address, which must include id itself to form a
+// new cluster). Pass an empty Membership to start a node that will *join*
+// an existing cluster: it stays passive, without campaigning, until a
+// leader adds it with AddServer and replicates the configuration to it.
+//
+// The bootstrap configuration only applies until the node has a snapshot
+// or a configuration entry in its log; after a restart those take
+// precedence.
+func NewNodeWithMembers(id string, members Membership, transport Transport, applyCh chan ApplyMsg, statePath string, snapshotPath ...string) (*Node, error) {
 	sp := ""
 	if len(snapshotPath) > 0 {
 		sp = snapshotPath[0]
 	}
+	if members == nil {
+		members = Membership{}
+	}
 	n := &Node{
 		id:            id,
-		peers:         peers,
+		baseConfig:    members.clone(),
 		statePath:     statePath,
 		snapshotPath:  sp,
 		transport:     transport,
@@ -250,10 +289,14 @@ func NewNode(id string, peers []string, transport Transport, applyCh chan ApplyM
 		n.commitIndex = snap.LastIncludedIndex
 		n.lastApplied = snap.LastIncludedIndex
 		n.log = []LogEntry{{Term: snap.LastIncludedTerm}}
+		if snap.Config != nil {
+			n.baseConfig = snap.Config.clone()
+		}
 	}
 	if err := n.restoreState(); err != nil {
 		return nil, fmt.Errorf("raft: restore: %w", err)
 	}
+	n.recomputeConfig()
 	transport.Register(id, n)
 	go n.electionLoop()
 	go n.heartbeatLoop()
@@ -343,7 +386,7 @@ func (n *Node) electionLoop() {
 		}
 
 		n.mu.Lock()
-		if !n.stopped() && n.role != Leader && time.Since(n.lastHeartbeat) >= timeout {
+		if !n.stopped() && n.role != Leader && n.isMember(n.id) && time.Since(n.lastHeartbeat) >= timeout {
 			n.startElection() // called with mu held
 		}
 		n.mu.Unlock()
@@ -364,9 +407,11 @@ func (n *Node) startElection() {
 	term := n.currentTerm
 	lastIdx, lastTerm := n.lastLogIndexAndTerm()
 
-	votes := 1                       // voted for self; guarded by n.mu
-	needed := (len(n.peers)+1)/2 + 1 // majority of total cluster size
-	if votes >= needed {
+	// Votes are counted against the configuration as of now; guarded by
+	// n.mu.
+	granted := map[string]bool{n.id: true}
+	won := func() bool { return n.hasQuorum(func(id string) bool { return granted[id] }) }
+	if won() {
 		n.becomeLeader() // single-node cluster
 		return
 	}
@@ -398,8 +443,8 @@ func (n *Node) startElection() {
 				return
 			}
 			if reply.VoteGranted {
-				votes++
-				if votes >= needed {
+				granted[peer] = true
+				if won() {
 					n.becomeLeader()
 				}
 			}
@@ -532,8 +577,8 @@ func (n *Node) sendAppendEntries(peer string) {
 			n.becomeFollower(reply.Term)
 			return
 		}
-		if n.role != Leader || n.currentTerm != term {
-			return // stale reply
+		if n.role != Leader || n.currentTerm != term || !n.isMember(peer) {
+			return // stale reply, or the peer was removed meanwhile
 		}
 		// Success or not, the peer accepted us as leader for this term.
 		n.recordAck(peer, round)
@@ -595,6 +640,7 @@ func (n *Node) sendInstallSnapshot(peer string) {
 		LastIncludedIndex: n.snapshotIndex,
 		LastIncludedTerm:  n.snapshotTerm,
 		Data:              n.snapshotData,
+		Config:            n.baseConfig.clone(),
 	}
 	term := n.currentTerm
 	round := n.hbRound
@@ -617,7 +663,7 @@ func (n *Node) sendInstallSnapshot(peer string) {
 			n.becomeFollower(reply.Term)
 			return
 		}
-		if n.role != Leader || n.currentTerm != term {
+		if n.role != Leader || n.currentTerm != term || !n.isMember(peer) {
 			return
 		}
 		n.recordAck(peer, round)
@@ -649,18 +695,16 @@ func (n *Node) maybeAdvanceCommitIndex() {
 		if n.termAt(idx) != n.currentTerm {
 			continue
 		}
-		count := 0
-		if n.selfDurable(idx) {
-			count = 1
-		}
-		for _, peer := range n.peers {
-			if n.matchIndex[peer] >= idx {
-				count++
+		stored := func(id string) bool {
+			if id == n.id {
+				return n.selfDurable(idx)
 			}
+			return n.matchIndex[id] >= idx
 		}
-		if count*2 > len(n.peers)+1 { // majority
+		if n.hasQuorum(stored) { // majority of the current configuration
 			n.commitIndex = idx
 			n.notifyApply()
+			n.stepDownIfRemoved()
 			break
 		}
 	}
@@ -702,6 +746,13 @@ func (n *Node) HandleRequestVote(args RequestVoteArgs) RequestVoteReply {
 	if args.Term < n.currentTerm {
 		return RequestVoteReply{Term: n.currentTerm, VoteGranted: false}
 	}
+	// §4.2.3: while we believe a leader is alive, ignore candidates
+	// entirely (don't even adopt their term). Otherwise a server removed
+	// from the cluster, which no longer gets heartbeats, would keep timing
+	// out and forcing pointless elections with ever-higher terms.
+	if args.Term > n.currentTerm && n.leaderAlive() {
+		return RequestVoteReply{Term: n.currentTerm, VoteGranted: false}
+	}
 	if args.Term > n.currentTerm {
 		n.becomeFollower(args.Term)
 	}
@@ -738,6 +789,7 @@ func (n *Node) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 	n.becomeFollower(args.Term) // also steps down a same-term candidate
 	n.leaderId = args.LeaderId
 	n.lastHeartbeat = time.Now() // valid message from current leader
+	n.lastLeaderContact = n.lastHeartbeat
 
 	// Entries at or below our snapshot are committed and already reflected
 	// in it. Skip that prefix and check consistency at the snapshot point
@@ -797,7 +849,8 @@ func (n *Node) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 		break
 	}
 	if changed {
-		n.persistEntries(firstChanged) // must persist log changes before replying success
+		n.persistEntries(firstChanged)      // must persist log changes before replying success
+		n.recomputeConfigFrom(firstChanged) // config entries take effect on append (or revert on truncation)
 	}
 
 	// Advance commitIndex to match the leader, bounded by the last entry
@@ -833,6 +886,7 @@ func (n *Node) HandleInstallSnapshot(args InstallSnapshotArgs) InstallSnapshotRe
 	n.becomeFollower(args.Term)
 	n.leaderId = args.LeaderId
 	n.lastHeartbeat = time.Now()
+	n.lastLeaderContact = n.lastHeartbeat
 
 	// Already have everything this snapshot contains (and it's committed):
 	// installing it would move the state machine backwards.
@@ -852,6 +906,7 @@ func (n *Node) HandleInstallSnapshot(args InstallSnapshotArgs) InstallSnapshotRe
 		LastIncludedIndex: args.LastIncludedIndex,
 		LastIncludedTerm:  args.LastIncludedTerm,
 		Data:              args.Data,
+		Config:            args.Config,
 	}
 	if err := n.writeSnapshot(snap); err != nil {
 		// Can't make the snapshot durable: don't adopt it. The leader
@@ -862,7 +917,11 @@ func (n *Node) HandleInstallSnapshot(args InstallSnapshotArgs) InstallSnapshotRe
 	n.snapshotIndex = args.LastIncludedIndex
 	n.snapshotTerm = args.LastIncludedTerm
 	n.snapshotData = args.Data
+	if args.Config != nil {
+		n.baseConfig = args.Config.clone()
+	}
 	n.rewriteLog()
+	n.recomputeConfig()
 
 	n.commitIndex = args.LastIncludedIndex
 	n.lastApplied = args.LastIncludedIndex
@@ -957,8 +1016,8 @@ func (n *Node) applyLoop() {
 			} else if n.lastApplied < n.commitIndex {
 				n.lastApplied++
 				e := n.entryAt(n.lastApplied)
-				if e.Command == nil {
-					continue
+				if !e.delivered() {
+					continue // no-ops and config entries aren't for the state machine
 				}
 				msg = ApplyMsg{CommandIndex: n.lastApplied, CommandTerm: e.Term, Command: e.Command}
 			} else {
@@ -991,6 +1050,15 @@ func (n *Node) SnapshotIndex() uint64 {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.snapshotIndex
+}
+
+// leaderAlive reports whether this node is the leader or has heard from
+// one within the minimum election timeout. Called with mu held.
+func (n *Node) leaderAlive() bool {
+	if n.role == Leader {
+		return true
+	}
+	return n.leaderId != "" && time.Since(n.lastLeaderContact) < electionTimeoutMin
 }
 
 func randDuration(min, max time.Duration) time.Duration {

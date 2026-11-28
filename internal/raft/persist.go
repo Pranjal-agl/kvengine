@@ -28,7 +28,8 @@ import (
 //	base:  Type=RecordDelete  Key=[8]index  Value=[8]term
 //	       The log starts at index (the snapshot sentinel). Always the first
 //	       record of a rewritten file.
-//	entry: Type=RecordPut     Key=[8]index  Value=[8]term [1]hasCommand command
+//	entry: Type=RecordPut     Key=[8]index  Value=[8]term [1]kind payload
+//	       kind: 0 = no-op, 1 = command, 2 = membership (JSON payload)
 //	       Writing entry i discards any entries >= i first — that is how a
 //	       follower's truncation of a conflicting suffix is recorded.
 //
@@ -147,7 +148,11 @@ func baseRecord(index, term uint64) wal.Record {
 func entryRecord(index uint64, e LogEntry) wal.Record {
 	v := make([]byte, 9, 9+len(e.Command))
 	binary.LittleEndian.PutUint64(v, e.Term)
-	if e.Command != nil {
+	switch {
+	case e.Kind == EntryConfig:
+		v[8] = 2
+		v = append(v, e.Command...)
+	case e.Command != nil:
 		v[8] = 1
 		v = append(v, e.Command...)
 	}
@@ -179,7 +184,11 @@ func replayLog(recs []wal.Record) (start uint64, log []LogEntry, err error) {
 				return 0, nil, fmt.Errorf("raft: log record %d malformed", i)
 			}
 			e := LogEntry{Term: term}
-			if r.Value[8] == 1 {
+			switch r.Value[8] {
+			case 1:
+				e.Command = append([]byte{}, r.Value[9:]...)
+			case 2:
+				e.Kind = EntryConfig
 				e.Command = append([]byte{}, r.Value[9:]...)
 			}
 			log = append(log[:idx-start], e)
