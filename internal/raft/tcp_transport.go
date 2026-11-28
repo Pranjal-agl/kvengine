@@ -53,13 +53,26 @@ func writeEnvelope(w io.Writer, env rpcEnvelope) error {
 	return err
 }
 
+// maxPayload is the largest message accepted for a type: a sanity cap so a
+// corrupt length can't trigger a huge allocation. AppendEntries batches are
+// capped at maxAppendBytes by the sender, so 64 MiB leaves room for one
+// maximum-size value plus encoding overhead. A snapshot carries the whole
+// state machine, which is held in memory anyway, so it gets a far larger
+// cap rather than being split into chunks.
+func maxPayload(t rpcType) uint32 {
+	if t&^rpcBinary == rpcInstallSnapshot {
+		return 2 << 30
+	}
+	return 64 << 20
+}
+
 func readEnvelope(r io.Reader) (rpcEnvelope, error) {
 	hdr := make([]byte, 5)
 	if _, err := io.ReadFull(r, hdr); err != nil {
 		return rpcEnvelope{}, err
 	}
 	length := binary.LittleEndian.Uint32(hdr[1:])
-	if length > 32<<20 { // 32 MiB sanity cap
+	if length > maxPayload(rpcType(hdr[0])) {
 		return rpcEnvelope{}, fmt.Errorf("tcp transport: rpc payload too large: %d", length)
 	}
 	payload := make([]byte, length)

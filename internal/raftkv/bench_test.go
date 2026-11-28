@@ -21,6 +21,11 @@ type tcpCluster struct {
 	nodes      []*raft.Node
 	kvs        []*KV
 	transports []*raft.TCPTransport
+
+	ids   []string
+	addrs map[string]string
+	dir   string
+	opts  Options
 }
 
 func newTCPCluster(tb testing.TB, opts Options) *tcpCluster {
@@ -37,29 +42,14 @@ func newTCPCluster(tb testing.TB, opts Options) *tcpCluster {
 		ln.Close()
 	}
 	dir := tb.TempDir()
-	c := &tcpCluster{}
-	for _, id := range ids {
-		var peers []string
-		for _, p := range ids {
-			if p != id {
-				peers = append(peers, p)
-			}
-		}
-		tr := raft.NewTCPTransport(addrs)
-		ch := make(chan raft.ApplyMsg, 256)
-		node, err := raft.NewNode(id, peers, tr, ch,
-			filepath.Join(dir, id+"-state.json"), filepath.Join(dir, id+"-snap.json"))
-		if err != nil {
-			tb.Fatal(err)
-		}
-		kv, err := New(node, ch, opts)
-		if err != nil {
-			tb.Fatal(err)
-		}
-		go tr.Serve(id)
-		c.nodes = append(c.nodes, node)
-		c.kvs = append(c.kvs, kv)
-		c.transports = append(c.transports, tr)
+	c := &tcpCluster{ids: ids, addrs: addrs, dir: dir, opts: opts}
+	for range ids {
+		c.nodes = append(c.nodes, nil)
+		c.kvs = append(c.kvs, nil)
+		c.transports = append(c.transports, nil)
+	}
+	for i := range ids {
+		c.restart(tb, i)
 	}
 	tb.Cleanup(func() {
 		for i := range c.nodes {
@@ -69,6 +59,35 @@ func newTCPCluster(tb testing.TB, opts Options) *tcpCluster {
 		}
 	})
 	return c
+}
+
+// restart (re)starts node i on its files and address.
+func (c *tcpCluster) restart(tb testing.TB, i int) {
+	tb.Helper()
+	id := c.ids[i]
+	var peers []string
+	for _, p := range c.ids {
+		if p != id {
+			peers = append(peers, p)
+		}
+	}
+	addrs := map[string]string{}
+	for k, v := range c.addrs {
+		addrs[k] = v
+	}
+	tr := raft.NewTCPTransport(addrs)
+	ch := make(chan raft.ApplyMsg, 256)
+	node, err := raft.NewNode(id, peers, tr, ch,
+		filepath.Join(c.dir, id+"-state.json"), filepath.Join(c.dir, id+"-snap.json"))
+	if err != nil {
+		tb.Fatal(err)
+	}
+	kv, err := New(node, ch, c.opts)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	go tr.Serve(id)
+	c.nodes[i], c.kvs[i], c.transports[i] = node, kv, tr
 }
 
 func (c *tcpCluster) leader(tb testing.TB) int {
@@ -177,5 +196,67 @@ func BenchmarkClusterPutShortLog(b *testing.B) {
 		if err := c.kvs[l].Put([]byte(fmt.Sprintf("k%d", i%1000)), val); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// A follower that falls far behind must be able to catch up even when the
+// entries it's missing add up to more than one RPC may carry (32 MiB).
+func TestFollowerCatchesUpAfterLargeBacklog(t *testing.T) {
+	if testing.Short() {
+		t.Skip("writes ~40 MB")
+	}
+	c := newTCPCluster(t, Options{SnapshotEvery: 0}) // no snapshots: catch-up must use the log
+	l := c.leader(t)
+	f := (l + 1) % 3
+	c.transports[f].Close() // follower drops off the network
+	c.nodes[f].Stop()
+
+	val := make([]byte, 1<<20)
+	for i := 0; i < 40; i++ {
+		if err := c.kvs[l].Put([]byte(fmt.Sprintf("big%d", i)), val); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Bring the follower back on the same files and address.
+	c.restart(t, f)
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if v, ok := c.kvs[f].Get([]byte("big39")); ok && len(v) == len(val) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("follower never caught up on a ~40 MB backlog (state %+v)", c.nodes[f].State())
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// Same, but the leader compacts its log meanwhile, so the follower must
+// receive a snapshot bigger than the old 32 MiB message cap.
+func TestFollowerCatchesUpWithLargeSnapshot(t *testing.T) {
+	if testing.Short() {
+		t.Skip("writes ~40 MB")
+	}
+	c := newTCPCluster(t, Options{SnapshotEvery: 10})
+	l := c.leader(t)
+	f := (l + 1) % 3
+	c.transports[f].Close()
+	c.nodes[f].Stop()
+	val := make([]byte, 1<<20)
+	for i := 0; i < 40; i++ {
+		if err := c.kvs[l].Put([]byte(fmt.Sprintf("big%d", i)), val); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if c.nodes[l].SnapshotIndex() == 0 {
+		t.Fatal("leader never snapshotted")
+	}
+	c.restart(t, f)
+	deadline := time.Now().Add(30 * time.Second)
+	for c.kvs[f].Len() < 41 { // 40 values + warmup key
+		if time.Now().After(deadline) {
+			t.Fatalf("follower has %d keys; never installed the large snapshot", c.kvs[f].Len())
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }

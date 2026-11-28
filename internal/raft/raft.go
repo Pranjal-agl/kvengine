@@ -30,6 +30,9 @@ import (
 )
 
 const (
+	// maxAppendBytes bounds the command bytes in one AppendEntries.
+	maxAppendBytes = 4 << 20
+
 	heartbeatInterval  = 50 * time.Millisecond
 	electionTimeoutMin = 200 * time.Millisecond
 	electionTimeoutMax = 400 * time.Millisecond
@@ -545,9 +548,18 @@ func (n *Node) sendAppendEntries(peer string) {
 
 	var entries []LogEntry
 	if n.lastIndex() >= nextIdx {
+		// Cap the batch so one RPC stays well under the transport's message
+		// limit: a follower far behind catches up over several RPCs. (An
+		// uncapped batch over the limit was rejected every time, so the
+		// follower could never catch up.) Always send at least one entry.
 		src := n.log[nextIdx-n.snapshotIndex:]
-		entries = make([]LogEntry, len(src))
-		copy(entries, src)
+		size, k := 0, 0
+		for k < len(src) && (k == 0 || size+len(src[k].Command) <= maxAppendBytes) {
+			size += len(src[k].Command) + 32
+			k++
+		}
+		entries = make([]LogEntry, k)
+		copy(entries, src[:k])
 	}
 
 	args := AppendEntriesArgs{
