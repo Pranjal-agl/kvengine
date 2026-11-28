@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"time"
 
 	"kvengine/internal/wal"
 )
@@ -19,7 +20,7 @@ import (
 // each level may hold about levelMultiplier times as many bytes as the one
 // above (L1: LevelSizeBase). A lookup checks at most one file per level.
 //
-// Compaction:
+// Compaction runs on a background goroutine (see "compaction" below):
 //   - When L0 reaches maxL0Tables files, all of L0 is merged with the L1
 //     files it overlaps into new L1 files.
 //   - When level i (i >= 1) exceeds its size budget, one of its files —
@@ -217,39 +218,196 @@ func (e *Engine) applyEdit(adds, dels []*SSTable) error {
 
 // ---- compaction ----
 
-// maybeCompact runs compactions until every level is within budget.
-// Called with mu held.
-func (e *Engine) maybeCompact() error {
+// A compaction runs in three steps, so that neither readers nor writers
+// wait on its I/O:
+//
+//  1. plan (cmu held, mu read-locked): choose the input files and copy the
+//     levels below the output level, for the tombstone rule;
+//  2. merge (cmu held, mu not held): read the inputs and write the output
+//     files. SSTables are immutable and are only closed by a compaction's
+//     own edit, so reading them unlocked is safe;
+//  3. install (cmu and mu held): the manifest edit swaps outputs for inputs.
+//
+// Flushes may add L0 files during step 2. That's fine: they are newer than
+// every input, stay in L0 (above the output), and the edit removes inputs
+// by identity, not "all of L0".
+
+var errCompactionAborted = errors.New("lsm: compaction abandoned: engine closing")
+
+type compaction struct {
+	upper    []*SSTable // newer inputs, oldest first
+	lower    []*SSTable // older inputs, at outLevel
+	outLevel int
+	deeper   [numLevels][]*SSTable // copies of the levels below outLevel
+}
+
+// signalCompaction wakes the background compactor. Never blocks.
+func (e *Engine) signalCompaction() {
+	select {
+	case e.compactCh <- struct{}{}:
+	default:
+	}
+}
+
+// compactLoop is the background compactor: on each signal it compacts
+// until every level is within budget. A failed compaction is retried after
+// compactRetryDelay; the error is kept in bgErr until one succeeds, so
+// stalled writers and Stats can see it.
+func (e *Engine) compactLoop() {
+	defer close(e.compactDone)
 	for {
-		if len(e.levels[0]) >= maxL0Tables {
-			if err := e.compactL0(); err != nil {
-				return err
-			}
-			continue
+		select {
+		case <-e.stopCh:
+			return
+		case <-e.compactCh:
 		}
-		lvl := 0
-		for i := 1; i < numLevels-1; i++ {
-			if levelBytes(e.levels[i]) > e.maxBytes(i) {
-				lvl = i
+		for !e.stopping.Load() {
+			e.cmu.Lock()
+			did, err := e.compactOnce()
+			e.cmu.Unlock()
+			if errors.Is(err, errCompactionAborted) {
+				return
+			}
+			e.mu.Lock()
+			e.bgErr = err
+			e.l0Cond.Broadcast()
+			e.mu.Unlock()
+			if err != nil {
+				e.opts.Logf("lsm: background compaction failed (retrying in %v): %v", compactRetryDelay, err)
+				select {
+				case <-e.stopCh:
+					return
+				case <-time.After(compactRetryDelay):
+				}
+				continue
+			}
+			if !did {
 				break
 			}
-		}
-		if lvl == 0 {
-			return nil
-		}
-		if err := e.compactLevel(lvl); err != nil {
-			return err
 		}
 	}
 }
 
-// compact merges all of L0 into L1. Called with mu held. (Also used
-// directly by tests.)
-func (e *Engine) compact() error {
-	if len(e.levels[0]) == 0 {
-		return nil
+// compactOnce runs the most urgent compaction, if any is needed. Called
+// with cmu held.
+func (e *Engine) compactOnce() (bool, error) {
+	e.mu.RLock()
+	c := e.pickCompaction()
+	e.mu.RUnlock()
+	if c == nil {
+		return false, nil
 	}
-	return e.compactL0()
+	return true, e.runCompaction(c)
+}
+
+// pickCompaction plans the next compaction: the level furthest over its
+// budget, scored as in LevelDB — L0 by file count (files/maxL0Tables),
+// deeper levels by bytes (bytes/budget). Returns nil if no score reaches 1.
+//
+// Scoring matters once compaction runs concurrently with writes: if L0
+// always went first, a steady write load would keep L0 at maxL0Tables and
+// L1 would never be compacted down, growing far past its budget until
+// every L0 merge rewrote all of it (write amplification went from 13.7x to
+// 34x on the 1.8M-key benchmark before this).
+//
+// Called with cmu held and mu at least read-locked.
+func (e *Engine) pickCompaction() *compaction {
+	best, bestScore := -1, 1.0
+	if s := float64(len(e.levels[0])) / maxL0Tables; s >= bestScore {
+		best, bestScore = 0, s
+	}
+	for i := 1; i < numLevels-1; i++ {
+		if s := float64(levelBytes(e.levels[i])) / float64(e.maxBytes(i)); s > bestScore {
+			best, bestScore = i, s
+		}
+	}
+	switch {
+	case best < 0:
+		return nil
+	case best == 0:
+		return e.planL0()
+	default:
+		return e.planLevel(best)
+	}
+}
+
+func (e *Engine) planL0() *compaction {
+	upper := append([]*SSTable(nil), e.levels[0]...) // oldest first
+	lo, hi := keyRange(upper)
+	return e.plan(upper, e.overlapping(1, lo, hi), 1)
+}
+
+func (e *Engine) planLevel(lvl int) *compaction {
+	files := e.levels[lvl]
+	// Round-robin through the key space so every part of the level gets
+	// compacted in turn: the first file past the last one compacted, or
+	// the first file once the end is reached.
+	pick := files[0]
+	for _, f := range files {
+		if f.minKey > e.compactPtr[lvl] {
+			pick = f
+			break
+		}
+	}
+	e.compactPtr[lvl] = pick.maxKey
+	return e.plan([]*SSTable{pick}, e.overlapping(lvl+1, pick.minKey, pick.maxKey), lvl+1)
+}
+
+func (e *Engine) plan(upper, lower []*SSTable, outLevel int) *compaction {
+	c := &compaction{upper: upper, lower: lower, outLevel: outLevel}
+	for i := outLevel + 1; i < numLevels; i++ {
+		c.deeper[i] = append([]*SSTable(nil), e.levels[i]...)
+	}
+	return c
+}
+
+// Compact merges all of L0 into L1, then runs whatever compactions that
+// makes necessary, before returning. Background compaction makes calling
+// it unnecessary; it is for tests and tools that want a settled tree.
+func (e *Engine) Compact() error {
+	e.cmu.Lock()
+	defer e.cmu.Unlock()
+	e.mu.RLock()
+	closed := e.closed
+	var c *compaction
+	if len(e.levels[0]) > 0 {
+		c = e.planL0()
+	}
+	e.mu.RUnlock()
+	if closed {
+		return ErrClosed
+	}
+	if c != nil {
+		if err := e.runCompaction(c); err != nil {
+			return err
+		}
+	}
+	return e.settle()
+}
+
+// WaitForCompactions returns once no level needs compacting, running any
+// outstanding compactions itself rather than waiting for the background
+// goroutine. For tests and benchmarks that check the tree's shape.
+func (e *Engine) WaitForCompactions() error {
+	e.cmu.Lock()
+	defer e.cmu.Unlock()
+	e.mu.RLock()
+	closed := e.closed
+	e.mu.RUnlock()
+	if closed {
+		return ErrClosed
+	}
+	return e.settle()
+}
+
+// settle compacts until nothing is over budget. Called with cmu held.
+func (e *Engine) settle() error {
+	for {
+		did, err := e.compactOnce()
+		if err != nil || !did {
+			return err
+		}
+	}
 }
 
 func keyRange(files []*SSTable) (lo, hi string) {
@@ -275,35 +433,16 @@ func (e *Engine) overlapping(lvl int, lo, hi string) []*SSTable {
 	return out
 }
 
-func (e *Engine) compactL0() error {
-	upper := append([]*SSTable{}, e.levels[0]...) // oldest first
-	lo, hi := keyRange(upper)
-	lower := e.overlapping(1, lo, hi)
-	return e.merge(upper, lower, 1)
-}
-
-func (e *Engine) compactLevel(lvl int) error {
-	files := e.levels[lvl]
-	// Round-robin through the key space so every part of the level gets
-	// compacted in turn: the first file past the last one compacted, or
-	// the first file once the end is reached.
-	pick := files[0]
-	for _, f := range files {
-		if f.minKey > e.compactPtr[lvl] {
-			pick = f
-			break
+// runCompaction merges c.upper (newer) with c.lower (older) into new files
+// at c.outLevel, then installs them. Called with cmu held and mu not held.
+func (e *Engine) runCompaction(c *compaction) error {
+	if e.opts.compactHook != nil {
+		if err := e.opts.compactHook(); err != nil {
+			return err
 		}
 	}
-	e.compactPtr[lvl] = pick.maxKey
-	lower := e.overlapping(lvl+1, pick.minKey, pick.maxKey)
-	return e.merge([]*SSTable{pick}, lower, lvl+1)
-}
-
-// merge combines upper (newer; oldest first within itself) with lower
-// (older) into new files at outLevel, then swaps them in atomically.
-func (e *Engine) merge(upper, lower []*SSTable, outLevel int) error {
 	merged := map[string]entry{}
-	for _, f := range append(append([]*SSTable{}, lower...), upper...) {
+	for _, f := range append(append([]*SSTable(nil), c.lower...), c.upper...) {
 		entries, err := f.readAll()
 		if err != nil {
 			return fmt.Errorf("lsm: compact: %w", err)
@@ -314,7 +453,7 @@ func (e *Engine) merge(upper, lower []*SSTable, outLevel int) error {
 	}
 	keys := make([]string, 0, len(merged))
 	for k, en := range merged {
-		if en.deleted && !e.deeperOverlaps(outLevel, k) {
+		if en.deleted && !c.deeperOverlaps(k) {
 			continue // nothing older left to shadow
 		}
 		keys = append(keys, k)
@@ -328,12 +467,18 @@ func (e *Engine) merge(upper, lower []*SSTable, outLevel int) error {
 		if len(batch) == 0 {
 			return nil
 		}
+		if e.stopping.Load() {
+			return errCompactionAborted
+		}
+		e.mu.Lock()
 		e.nextID++
-		f, err := writeSSTable(e.dir, outLevel, e.nextID, batch)
+		id := e.nextID
+		e.mu.Unlock()
+		f, err := writeSSTable(e.dir, c.outLevel, id, batch)
 		if err != nil {
 			return err
 		}
-		e.bytesWritten += f.size
+		e.bytesWritten.Add(f.size)
 		outs = append(outs, f)
 		batch, batchBytes = nil, 0
 		return nil
@@ -351,9 +496,17 @@ func (e *Engine) merge(upper, lower []*SSTable, outLevel int) error {
 	if err := flushOut(); err != nil {
 		return discard(outs, err)
 	}
-	if err := e.applyEdit(outs, append(append([]*SSTable{}, upper...), lower...)); err != nil {
+	if e.stopping.Load() {
+		return discard(outs, errCompactionAborted)
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if err := e.applyEdit(outs, append(append([]*SSTable(nil), c.upper...), c.lower...)); err != nil {
 		return discard(outs, err)
 	}
+	e.compactions.Add(1)
+	e.l0Cond.Broadcast()
 	return nil
 }
 
@@ -367,11 +520,11 @@ func discard(outs []*SSTable, err error) error {
 	return err
 }
 
-// deeperOverlaps reports whether any level below lvl has a file whose key
-// range covers key.
-func (e *Engine) deeperOverlaps(lvl int, key string) bool {
-	for i := lvl + 1; i < numLevels; i++ {
-		if f := findFile(e.levels[i], key); f != nil {
+// deeperOverlaps reports whether any level below the output level has a
+// file whose key range covers key.
+func (c *compaction) deeperOverlaps(key string) bool {
+	for i := c.outLevel + 1; i < numLevels; i++ {
+		if f := findFile(c.deeper[i], key); f != nil {
 			return true
 		}
 	}

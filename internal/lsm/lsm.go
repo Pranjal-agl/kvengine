@@ -4,12 +4,13 @@
 //   - Writes go to an in-memory MemTable.
 //   - When the MemTable exceeds a size threshold, it's flushed to an
 //     immutable, sorted SSTable file on disk (Level 0).
-//   - When L0 has too many files, compaction merges L0 and L1 into a single
-//     new L1 file, dropping overwritten values and tombstones.
+//   - A background goroutine compacts levels that are over budget (leveled
+//     compaction, levels.go), dropping overwritten values and tombstones.
+//     Writers don't wait for it unless L0 backs up to l0StopWrites files.
 //
-// Reads check MemTable → L0 (newest first) → L1. The first entry found for
-// a key wins, *including* a tombstone: a delete in a newer layer must hide
-// any value in an older one.
+// Reads check MemTable → L0 (newest first) → one file per deeper level. The
+// first entry found for a key wins, *including* a tombstone: a delete in a
+// newer layer must hide any value in an older one.
 //
 // Durability: every write is appended to a write-ahead log and fsynced
 // before it reaches the MemTable (Options.NoSync relaxes this), so an
@@ -32,6 +33,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"kvengine/internal/wal"
 )
@@ -39,6 +42,14 @@ import (
 const (
 	defaultMemTableSize = 4 * 1024 * 1024 // 4 MiB before flush
 	maxL0Tables         = 4               // compact L0→L1 when L0 has this many SSTables
+	// l0StopWrites: a write that flushes waits for background compaction
+	// while L0 has this many files, so reads (which check every L0 file)
+	// can't degrade without bound when writes outpace compaction. LevelDB
+	// uses the same 4/12 thresholds.
+	l0StopWrites = 3 * maxL0Tables
+	// compactRetryDelay: after a failed background compaction (disk full,
+	// I/O error), wait this long before retrying.
+	compactRetryDelay = time.Second
 
 	// indexInterval: the sparse index records the file offset of every
 	// indexInterval-th entry. A lookup binary-searches the index, seeks to
@@ -302,6 +313,13 @@ type Options struct {
 	// LevelSizeBase is the byte budget of L1; each deeper level gets 10x
 	// the previous one. Default 10 MiB.
 	LevelSizeBase int
+	// Logf receives background compaction errors. Default: discard (they
+	// are also reported by Stats and to writers that stall on them).
+	Logf func(format string, args ...any)
+
+	// compactHook, if set, runs at the start of every compaction; an
+	// error fails it. Tests use it to block or break compaction.
+	compactHook func() error
 }
 
 // Engine is the top-level LSM storage engine. Safe for concurrent use.
@@ -314,28 +332,46 @@ type Options struct {
 // to MemTable order (memory must never disagree with the log). wmu is held
 // by the leader while committing and by Flush/Close, so they never
 // interleave. mu guards the in-memory structures; readers hold it only for
-// lookups, so they never wait on a writer's fsync.
-// Lock order: wmu, then mu; qmu is a leaf.
+// lookups, so they never wait on a writer's fsync, a flush's SSTable write,
+// or a compaction's merge — those run without mu and take it only to
+// install their result.
+//
+// cmu serialises compactions: the background goroutine and Compact /
+// WaitForCompactions. Only compactions change levels 1 and below (flushes
+// only add to L0), so a compaction holding cmu can plan against a copy of
+// those levels and know it is still accurate when it installs its output.
+//
+// Lock order: wmu, then cmu, then mu; qmu is a leaf.
 type Engine struct {
 	wmu        sync.Mutex
 	qmu        sync.Mutex
 	wq         []*writeReq
 	committing bool
+	cmu        sync.Mutex
 	mu         sync.RWMutex
+	l0Cond     *sync.Cond // on &mu; signalled when L0 shrinks or bgErr changes
 	dir        string
 	opts       Options
 	memtable   *MemTable
 	// levels[0] is L0: flushed MemTables, oldest first, may overlap.
 	// levels[1:] are sorted by key with disjoint ranges (levels.go).
 	levels     [numLevels][]*SSTable
-	compactPtr [numLevels]string // round-robin compaction cursor per level
+	compactPtr [numLevels]string // round-robin compaction cursor per level; cmu
 	nextID     int
 	closed     bool
+	bgErr      error // last background compaction error, nil once one succeeds
 
 	manifest      *wal.WAL // live-file log (levels.go)
 	manifestEdits int
 
-	bytesWritten int64 // SSTable bytes written (flushes + compactions)
+	bytesWritten atomic.Int64 // SSTable bytes written (flushes + compactions)
+	compactions  atomic.Int64 // compactions completed
+	writeStalls  atomic.Int64 // flushes that waited for compaction
+
+	compactCh   chan struct{} // buffered(1): "there may be work"
+	stopping    atomic.Bool   // set by Close; aborts an in-progress merge
+	stopCh      chan struct{}
+	compactDone chan struct{}
 
 	wal      *wal.WAL // WAL for the current MemTable
 	walFiles []string // WAL files whose contents are in the current MemTable
@@ -363,7 +399,8 @@ const maxBatch = 1024
 // SSTables the MANIFEST lists as live (see levels.go); any other SSTable
 // is a leftover from an interrupted flush or compaction and is deleted.
 // WALs left by a crash are replayed in order into the MemTable, which is
-// then flushed so recovery starts from a clean slate.
+// then flushed so recovery starts from a clean slate. Open starts the
+// background compaction goroutine; Close stops it.
 func Open(dir string) (*Engine, error) { return OpenWithOptions(dir, Options{}) }
 
 // OpenWithOptions is Open with explicit options.
@@ -380,7 +417,16 @@ func OpenWithOptions(dir string, opts Options) (*Engine, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("lsm: mkdir: %w", err)
 	}
-	e := &Engine{dir: dir, opts: opts, memtable: newMemTable()}
+	if opts.Logf == nil {
+		opts.Logf = func(string, ...any) {}
+	}
+	e := &Engine{
+		dir: dir, opts: opts, memtable: newMemTable(),
+		compactCh:   make(chan struct{}, 1),
+		stopCh:      make(chan struct{}),
+		compactDone: make(chan struct{}),
+	}
+	e.l0Cond = sync.NewCond(&e.mu)
 
 	names, err := os.ReadDir(dir)
 	if err != nil {
@@ -433,10 +479,11 @@ func OpenWithOptions(dir string, opts Options) (*Engine, error) {
 	}
 	// Flush what was recovered (or, if nothing, just retire the old WALs
 	// and open a fresh one).
-	if err := e.flushLocked(); err != nil {
+	if err := e.flush(); err != nil {
 		e.closeTables()
 		return nil, err
 	}
+	go e.compactLoop()
 	return e, nil
 }
 
@@ -521,16 +568,40 @@ func (e *Engine) commitBatch(batch []*writeReq) error {
 	}
 
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	for _, r := range batch {
 		e.memtable.set(r.en)
 	}
-	if e.memtable.size < e.opts.MemTableSize {
+	full := e.memtable.size >= e.opts.MemTableSize
+	e.mu.Unlock()
+	if !full {
 		return nil
 	}
 	// The writes are durable and visible either way; a flush error is
 	// still reported so callers learn the engine can't flush.
-	return e.flushLocked()
+	if err := e.flush(); err != nil {
+		return err
+	}
+	return e.waitForL0()
+}
+
+// waitForL0 stalls the writer (wmu is held, so all writers) while L0 has
+// l0StopWrites or more files, until background compaction catches up.
+// Returns the compaction error if compaction is failing, rather than
+// waiting indefinitely.
+func (e *Engine) waitForL0() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(e.levels[0]) < l0StopWrites {
+		return nil
+	}
+	e.writeStalls.Add(1)
+	for len(e.levels[0]) >= l0StopWrites && !e.closed && e.bgErr == nil {
+		e.l0Cond.Wait()
+	}
+	if len(e.levels[0]) >= l0StopWrites && e.bgErr != nil {
+		return fmt.Errorf("lsm: L0 is full and compaction is failing: %w", e.bgErr)
+	}
+	return nil
 }
 
 // Get looks up key. Search order: MemTable → L0 (newest first) → one file
@@ -586,41 +657,57 @@ func result(en entry) ([]byte, bool, error) {
 	return []byte(en.value), true, nil
 }
 
-// flushLocked writes the MemTable to a new L0 SSTable, switches to a new
-// WAL, deletes the WAL(s) the SSTable now covers, and compacts if L0 is
-// full. Called with wmu and mu held (or during Open).
+// flush writes the MemTable to a new L0 SSTable, switches to a new WAL,
+// deletes the WAL(s) the SSTable now covers, and wakes the compactor.
+// Called with wmu held and mu not held (or during Open). Holding wmu keeps
+// the MemTable unchanged while the SSTable is written without mu, so
+// readers carry on reading the MemTable in the meantime.
 //
 // The SSTable is durable before any WAL is deleted, so a crash at any
 // point leaves every write in at least one of them. A WAL that survives
 // alongside its SSTable is replayed on Open; that only re-applies values
 // the SSTable already has, in order, which is harmless.
-func (e *Engine) flushLocked() error {
-	flushed := false
+func (e *Engine) flush() error {
+	e.mu.Lock()
+	var entries []entry
+	var id int
 	if len(e.memtable.data) > 0 {
+		entries = e.memtable.sorted()
 		e.nextID++
-		sst, err := writeSSTable(e.dir, 0, e.nextID, e.memtable.sorted())
-		if err != nil {
+		id = e.nextID
+	}
+	e.mu.Unlock()
+
+	var sst *SSTable
+	if entries != nil {
+		var err error
+		if sst, err = writeSSTable(e.dir, 0, id, entries); err != nil {
 			return err
 		}
-		e.bytesWritten += sst.size
+		e.bytesWritten.Add(sst.size)
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if sst != nil {
 		if err := e.applyEdit([]*SSTable{sst}, nil); err != nil {
 			return discard([]*SSTable{sst}, err)
 		}
 		e.memtable = newMemTable()
-		flushed = true
 	}
 	// A new WAL is needed after a flush, on first open, and after
 	// recovery (when several old WALs fed the MemTable).
-	if flushed || e.wal == nil || len(e.walFiles) != 1 {
+	if sst != nil || e.wal == nil || len(e.walFiles) != 1 {
 		if err := e.rotateWAL(); err != nil {
 			return err
 		}
 	}
-	return e.maybeCompact()
+	e.signalCompaction()
+	return nil
 }
 
 // rotateWAL opens a fresh WAL for the (now empty) MemTable and deletes the
-// WAL files whose contents have been flushed.
+// WAL files whose contents have been flushed. Called with mu held.
 func (e *Engine) rotateWAL() error {
 	e.nextID++
 	path := filepath.Join(e.dir, walName(e.nextID))
@@ -642,28 +729,44 @@ func (e *Engine) rotateWAL() error {
 func (e *Engine) Flush() error {
 	e.wmu.Lock()
 	defer e.wmu.Unlock()
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.closed {
+	e.mu.RLock()
+	closed, empty := e.closed, len(e.memtable.data) == 0
+	e.mu.RUnlock()
+	if closed {
 		return ErrClosed
 	}
-	if len(e.memtable.data) == 0 {
+	if empty {
 		return nil
 	}
-	return e.flushLocked()
+	return e.flush()
 }
 
-// Close flushes the MemTable and releases all open files.
+// Close flushes the MemTable, stops background compaction (abandoning a
+// merge in progress; its partial output is never installed) and releases
+// all open files.
 func (e *Engine) Close() error {
 	e.wmu.Lock()
 	defer e.wmu.Unlock()
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.closed {
+	e.mu.RLock()
+	closed := e.closed
+	e.mu.RUnlock()
+	if closed {
 		return nil
 	}
-	err := e.flushLocked()
+	err := e.flush()
+
+	e.stopping.Store(true)
+	e.mu.Lock()
 	e.closed = true
+	e.l0Cond.Broadcast()
+	e.mu.Unlock()
+	close(e.stopCh)
+	<-e.compactDone
+	e.cmu.Lock() // wait out a Compact or WaitForCompactions call
+	defer e.cmu.Unlock()
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	e.closeTables()
 	if e.wal != nil {
 		e.wal.Close()
@@ -695,13 +798,20 @@ func (e *Engine) Stats() map[string]interface{} {
 	for lvl := range e.levels {
 		files[lvl], bytes[lvl] = len(e.levels[lvl]), levelBytes(e.levels[lvl])
 	}
+	var bgErr string
+	if e.bgErr != nil {
+		bgErr = e.bgErr.Error()
+	}
 	return map[string]interface{}{
-		"memtable_bytes": e.memtable.size,
-		"l0_files":       files[0],
-		"l1_files":       files[1],
-		"level_files":    files,
-		"level_bytes":    bytes,
-		"bytes_written":  e.bytesWritten,
+		"memtable_bytes":   e.memtable.size,
+		"l0_files":         files[0],
+		"l1_files":         files[1],
+		"level_files":      files,
+		"level_bytes":      bytes,
+		"bytes_written":    e.bytesWritten.Load(),
+		"compactions":      e.compactions.Load(),
+		"write_stalls":     e.writeStalls.Load(),
+		"compaction_error": bgErr,
 	}
 }
 

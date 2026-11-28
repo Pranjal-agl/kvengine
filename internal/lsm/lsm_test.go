@@ -2,11 +2,14 @@ package lsm
 
 import (
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestPutGet(t *testing.T) {
@@ -101,12 +104,9 @@ func TestTombstoneInL0ShadowsL1(t *testing.T) {
 	e, _ := Open(t.TempDir())
 	e.Put([]byte("ghost"), []byte("present"))
 	e.Flush()
-	e.mu.Lock()
-	if err := e.compact(); err != nil {
-		e.mu.Unlock()
+	if err := e.Compact(); err != nil { // ghost=present now lives in L1
 		t.Fatal(err)
 	}
-	e.mu.Unlock() // ghost=present now lives in L1
 	e.Delete([]byte("ghost"))
 	e.Flush() // tombstone in L0
 	if v, ok := e.Get([]byte("ghost")); ok {
@@ -131,12 +131,9 @@ func TestCompaction(t *testing.T) {
 	e.Flush()
 	e.Flush()
 
-	e.mu.Lock()
-	if err := e.compact(); err != nil {
-		e.mu.Unlock()
+	if err := e.Compact(); err != nil {
 		t.Fatal(err)
 	}
-	e.mu.Unlock()
 
 	stats := e.Stats()
 	t.Logf("after compaction: %v", stats)
@@ -167,11 +164,9 @@ func TestSSTableFileCountBounded(t *testing.T) {
 			e.Put([]byte(fmt.Sprintf("r%d-k%d", round, i)), []byte("v"))
 		}
 		e.Flush()
-		e.mu.Lock()
-		if len(e.levels[0]) >= maxL0Tables {
-			e.compact()
-		}
-		e.mu.Unlock()
+	}
+	if err := e.WaitForCompactions(); err != nil {
+		t.Fatal(err)
 	}
 
 	files, _ := filepath.Glob(filepath.Join(dir, "*.sst"))
@@ -276,11 +271,9 @@ func TestReopenAfterInterruptedCompaction(t *testing.T) {
 	for _, f := range files {
 		saved[f], _ = os.ReadFile(f)
 	}
-	e.mu.Lock()
-	if err := e.compact(); err != nil {
+	if err := e.Compact(); err != nil {
 		t.Fatal(err)
 	}
-	e.mu.Unlock()
 	e.Close()
 	for f, b := range saved {
 		os.WriteFile(f, b, 0o644)
@@ -439,7 +432,68 @@ func benchWriteAmp(b *testing.B, n int) {
 			userBytes += len(key) + len(val)
 			e.Put([]byte(key), []byte(val))
 		}
+		e.WaitForCompactions() // count compaction work the load triggered
 		e.Close()
-		b.ReportMetric(float64(e.bytesWritten)/float64(userBytes), "write-amp")
+		b.ReportMetric(float64(e.bytesWritten.Load())/float64(userBytes), "write-amp")
+	}
+}
+
+// BenchmarkLSMLatencyUnderCompaction loads 400k scattered keys (NoSync, so
+// fsync doesn't hide the effect) while a reader looks up keys already
+// written, and reports Put and Get latency percentiles. With compaction
+// inline, the write that triggers a compaction (and any read behind the
+// engine lock) waits for the whole merge.
+func BenchmarkLSMLatencyUnderCompaction(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		e, _ := OpenWithOptions(b.TempDir(), Options{MemTableSize: 256 << 10, TargetFileSize: 256 << 10,
+			LevelSizeBase: 1 << 20, NoSync: true})
+		const n = 400000
+		var written atomic.Int64
+		stop := make(chan struct{})
+		readLat := make(chan []time.Duration, 1)
+		go func() {
+			var lat []time.Duration
+			r := rand.New(rand.NewSource(1))
+			for {
+				select {
+				case <-stop:
+					readLat <- lat
+					return
+				default:
+				}
+				w := written.Load()
+				if w == 0 {
+					continue
+				}
+				k := fmt.Sprintf("key-%08d", (int(r.Int63n(w))*7919)%n)
+				t0 := time.Now()
+				e.Get([]byte(k))
+				lat = append(lat, time.Since(t0))
+			}
+		}()
+		putLat := make([]time.Duration, 0, n)
+		start := time.Now()
+		for k := 0; k < n; k++ {
+			key := fmt.Sprintf("key-%08d", (k*7919)%n)
+			t0 := time.Now()
+			e.Put([]byte(key), []byte("value-padding-value"))
+			putLat = append(putLat, time.Since(t0))
+			written.Store(int64(k + 1))
+		}
+		elapsed := time.Since(start)
+		close(stop)
+		gets := <-readLat
+		e.Close()
+		report := func(prefix string, l []time.Duration) {
+			sort.Slice(l, func(i, j int) bool { return l[i] < l[j] })
+			pct := func(p float64) float64 { return float64(l[int(float64(len(l)-1)*p)].Microseconds()) }
+			b.ReportMetric(pct(0.5), prefix+"-p50-us")
+			b.ReportMetric(pct(0.99), prefix+"-p99-us")
+			b.ReportMetric(pct(0.999), prefix+"-p99.9-us")
+			b.ReportMetric(float64(l[len(l)-1].Microseconds()), prefix+"-max-us")
+		}
+		report("put", putLat)
+		report("get", gets)
+		b.ReportMetric(elapsed.Seconds(), "load-s")
 	}
 }

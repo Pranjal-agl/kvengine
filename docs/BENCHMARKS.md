@@ -104,15 +104,32 @@ An earlier version measured LSM Put at ~60 ns, but that was an in-memory write w
 SSTable bytes written per user byte while loading N unique keys in scattered order (`BenchmarkLSMWriteAmplification`, small memtable and proportionally scaled levels):
 
 ```
-keys        two levels (before)    leveled (after)
-200k        6.0x                   5.9x
-600k        16.8x                  10.2x
-1.8M        (not run; linear)      13.7x
+keys        two levels    leveled, inline    leveled, background
+200k        6.0x          5.9x               5.4x
+600k        16.8x         10.2x              7.5x
+1.8M        (linear)      13.7x              10.4x
 ```
 
-With two levels, every L0 compaction rewrote all of L1, so the cost grew in proportion to the data. With leveled compaction it grows with the number of levels. The 600k-key load also went from 10.9 s to 5.3 s.
+With two levels, every L0 compaction rewrote all of L1, so the cost grew in proportion to the data. With leveled compaction it grows with the number of levels. The 600k-key load went from 10.9 s (two levels) to 5.3 s (leveled), and the 1.8M-key load from 26.8 s (inline) to 19.0 s (background). Background compaction writes less because L0 can collect more files before a merge, so each L1 rewrite absorbs more of them; but only once compaction is scheduled by score: with L0 always first, L1 was starved and the 1.8M load hit 34x.
 
-What's left compared with production LSMs (LevelDB, RocksDB): a block cache, and compaction in the background instead of on the write that triggers it.
+### Background compaction: latency
+
+`BenchmarkLSMLatencyUnderCompaction`: one writer loads 400k scattered keys (NoSync, so fsync doesn't mask the effect) while a reader looks up keys already written. Three runs each, same machine:
+
+```
+                    inline (before)        background (after)
+Put p50             6 us                   5-6 us
+Put p99             35-40 us               40-45 us
+Put p99.9           213-238 us             0.9-1.2 ms
+Put max             300-400 ms             23-31 ms
+Get p99.9           171-185 us             0.48-0.53 ms
+Get max             300-400 ms             10-20 ms
+Load time           7.2-7.6 s              5.0-5.3 s
+```
+
+The worst case drops ~15x for writes and ~25x for reads, since nobody waits for a whole merge any more; what remains of the Put maximum is a MemTable flush (still on the writer, bounded by MemTableSize). The trade is the tail just below it: on this 2-vCPU VM the compactor competes with the writer and the reader for CPU, so p99.9 rises. With more cores, or a rate limit on compaction I/O, that cost would shrink.
+
+What's left compared with production LSMs (LevelDB, RocksDB): a block cache, flushing an immutable MemTable in the background as well, and compaction rate limiting.
 
 ---
 

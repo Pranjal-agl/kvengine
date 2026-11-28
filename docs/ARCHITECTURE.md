@@ -287,10 +287,28 @@ Each SSTable also gets a Bloom filter over its keys (`bloom.go`), built during t
 The first design had two levels, and every L0 compaction merged *all* of L1 into one file. Write amplification therefore grew linearly with the data: 6× at 5 MB, 17× at 16 MB. The engine now uses the LevelDB scheme (`levels.go`):
 
 - **Levels:** L1–L6 hold files with disjoint key ranges, sorted by key, each about `TargetFileSize`; each level's budget is 10× the previous one. A lookup reads at most one file per level (binary search on file ranges, then the bloom filter).
-- **Compaction:** when L0 has 4 files, they merge with only the L1 files they overlap. When a level exceeds its budget, one of its files (chosen round-robin through the key space) merges with the files it overlaps one level down. Outputs are split at `TargetFileSize`.
+- **Compaction:** when L0 has 4 files, they merge with only the L1 files they overlap. When a level exceeds its budget, one of its files (chosen round-robin through the key space) merges with the files it overlaps one level down. Outputs are split at `TargetFileSize`. When several levels need it, the one furthest over budget goes first (L0 scored by file count over 4, deeper levels by bytes over budget, as in LevelDB).
 - **Tombstones:** a tombstone is dropped only when no deeper level has a file covering its key. Otherwise it must keep shadowing the older value below. The randomized model test catches dropping them unconditionally.
 
-Write amplification for scattered keys is now 5.9× / 10.2× / 13.7× at 200k / 600k / 1.8M keys, growing with the number of levels rather than the data size.
+Write amplification for scattered keys is 5.4× / 7.5× / 10.4× at 200k / 600k / 1.8M keys (it was 5.9× / 10.2× / 13.7× with compaction inline), growing with the number of levels rather than the data size.
+
+### Background compaction
+
+Compaction used to run inline: the write that filled L0 did the merge, holding the engine lock, so that write, every writer queued behind it and every reader waited for the whole merge (up to ~0.4 s in `BenchmarkLSMLatencyUnderCompaction`). It now runs on one background goroutine, in three steps, so neither readers nor writers wait on its I/O:
+
+1. **Plan** (read lock): choose the inputs, and copy the levels below the output level for the tombstone rule.
+2. **Merge** (no engine lock): read the inputs, write the outputs. SSTables are immutable and are only closed by a compaction's own manifest edit, so reading them unlocked is safe.
+3. **Install** (write lock): one manifest edit swaps outputs for inputs, exactly as before.
+
+A separate mutex (`cmu`) runs one compaction at a time. Only compactions change levels 1 and below (a flush only adds an L0 file), so the copy taken in step 1 is still accurate in step 3. A flush can add L0 files during the merge; that's fine, because they are newer than every input, stay above the output, and the edit removes inputs by identity rather than "all of L0". Crash safety is unchanged: outputs are durable before the edit, and anything not in the manifest is deleted on open.
+
+Flushes still run on the writer that fills the MemTable (bounded by `MemTableSize`), but the SSTable is now written without the engine lock: `wmu` already keeps the MemTable from changing, so readers carry on reading it during the write.
+
+Backpressure: if writes outpace compaction, L0 grows, and every read checks every L0 file. Once L0 reaches 12 files (LevelDB's stop trigger), a write that flushes waits until compaction brings it down. If compaction is failing (disk full, I/O error), it retries every second, `Stats()` reports the error, and a write that would stall returns it instead of hanging. `Close` abandons a merge in progress; its outputs aren't in the manifest, so they are simply deleted.
+
+Getting the scheduling right mattered. The first version always compacted L0 first when it had 4 files. With compaction concurrent with writes, L0 is nearly always at 4, so L1 was never compacted down; it grew far past its budget until every L0 merge rewrote all of it, and write amplification at 1.8M keys went from 13.7× to 34× (`TestPickCompactionScoresLevels` pins the fix). Another early failure was in the tests: the randomized model test "crashes" by abandoning an engine and reopening the directory, and the abandoned engine's compactor kept running against it. The test's `crash` now stops the goroutine, as a real crash would.
+
+`Compact()` (merge all of L0, then settle) and `WaitForCompactions()` (settle) run compactions in the caller, for tests and tools that want a settled tree. Tests: `TestWritesDontWaitForCompaction` (writes and reads proceed while a compaction is blocked), `TestWritesStallAtL0Limit`, `TestCompactionErrorReachesStalledWriters`, `TestReadsDuringBackgroundCompaction` (concurrent writers and readers; no read older than an acknowledged write).
 
 ### Durability and recovery
 
@@ -302,11 +320,11 @@ Writes go to the MemTable, an in-memory map that is sorted when it is flushed. W
 
 ### Read path
 
-Search order: MemTable first, then L0 SSTables newest-to-oldest, then L1. A tombstone in a newer layer shadows any value in an older layer. This is the key correctness property: MemTable.Delete must stop the search before it reaches L0, otherwise a deleted key would reappear.
+Search order: MemTable first, then L0 SSTables newest-to-oldest, then at most one file per deeper level. A tombstone in a newer layer shadows any value in an older layer. This is the key correctness property: MemTable.Delete must stop the search before it reaches L0, otherwise a deleted key would reappear.
 
 ### Compaction
 
-When L0 has too many SSTables (default 4), they are merged with L1 into a new L1 SSTable. Compaction:
+Merging (see "Leveled compaction" above for which files):
 - Applies entries oldest-to-newest so newer values override older ones correctly.
 - Drops tombstoned keys so deleted data does not accumulate forever.
 - Removes the old files from disk.

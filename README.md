@@ -21,7 +21,7 @@ go test -race ./...   # all green
 - **Raft consensus** - leader election, log replication, snapshots with InstallSnapshot for lagging followers, and an append-only on-disk log. Writes are acknowledged only once committed by a quorum. Survives leader failures and network partitions.
 - **Membership changes** - add or remove nodes in a running cluster, one at a time (Raft thesis §4.1): `ADDNODE`, `REMOVENODE`, `MEMBERS`, and `--join` for new nodes. Removed nodes can't disrupt the cluster. Checked by a chaos test mixing membership changes, partitions, crashes and restarts.
 - **Linearizable reads from any node** - GETs use ReadIndex (Raft thesis §6.4): the leader confirms it still holds a quorum before answering, and followers ask the leader for a read index and catch up before reading locally. A partitioned ex-leader refuses reads instead of serving stale data. Checked with a Wing-Gong linearizability checker over concurrent histories.
-- **LSM storage engine** - a MemTable + SSTable alternative to the WAL store: write-ahead logged with group commit (survives SIGKILL mid-flush and mid-compaction), sparse indexes and bloom filters on SSTables, and leveled compaction (L0-L6 with a crash-safe manifest), so write amplification grows with the number of levels, not the data size.
+- **LSM storage engine** - a MemTable + SSTable alternative to the WAL store: write-ahead logged with group commit (survives SIGKILL mid-flush and mid-compaction), sparse indexes and bloom filters on SSTables, and leveled compaction (L0-L6 with a crash-safe manifest) on a background goroutine, so write amplification grows with the number of levels, not the data size, and neither readers nor writers wait for a merge.
 
 ---
 
@@ -137,6 +137,7 @@ make e2e                 # real processes: failover, membership, crashes, v1.0 m
 | `test/fault_injection` | `TestStoreCompactionFaultInjection` | SIGKILL during WAL compaction (rewrite + rename) never loses an acknowledged write |
 | `internal/raft` | `FuzzDecodeRPC`, `TestTCPTransportFallsBackToJSONForOldPeers` | The binary RPC codec never panics on garbage; new nodes interoperate with old JSON-only ones |
 | `internal/lsm` | `TestCompaction`, `TestTombstoneInSSTableShadowsOlderSSTable` | Compaction merges levels correctly; deletes shadow older values in every layer |
+| `internal/lsm` | `TestWritesDontWaitForCompaction`, `TestReadsDuringBackgroundCompaction`, `TestCompactionErrorReachesStalledWriters` | Writes and reads proceed during a compaction; concurrent readers never see a value older than an acknowledged write; a failing compaction surfaces as an error instead of a hang |
 | `internal/lsm` | `TestReopenAfterInterruptedCompaction` | A crash mid-compaction can't resurrect deleted or overwritten data |
 | `test/fault_injection` | `TestLSMFaultInjection` | SIGKILL during constant flushes/compactions never loses an acknowledged LSM write |
 | `internal/lsm` | `TestConcurrentSameKeyMemoryMatchesRecovery`, `TestBloomNoFalseNegativesAndLowFPRate` | LSM group commit keeps memory and WAL in the same order; bloom filters never miss a present key, ~0.8% false positives |
@@ -195,7 +196,7 @@ Keys are whitespace-delimited text. Values are length-prefixed binary, so arbitr
 - **No leader leases.** Linearizable reads confirm leadership with a quorum heartbeat round (~15 us on loopback; concurrent reads share one). Leases would skip that round trip, but they are only safe if clocks never drift more than the lease margin; the project chooses the check that doesn't depend on clocks.
 - **Snapshots are whole and in memory.** The state machine is an in-memory map, and snapshots are built, stored and sent as one piece (up to 2 GiB on the wire), not streamed in chunks. Data must fit in RAM in Raft mode.
 - **No leadership transfer**, and a membership change doesn't first catch up a new node as a non-voting learner. Adding a node that is far behind briefly makes commits wait for a majority that includes it.
-- **LSM compaction runs inline** on the write that triggers it, so that write (and those queued behind it) waits for the compaction. Production engines compact in the background.
+- **LSM flushes run on the writer** that fills the MemTable (compaction runs in the background). That write waits for one MemTable's worth of SSTable write, bounded by `MemTableSize`; readers don't. Production engines flush an immutable MemTable in the background too.
 - **The WAL store can't compact while replicating** (legacy leader/follower mode streams the log by byte offset).
 - **Upgrading from v1.0 must be done offline.** Stop every node, then start them all on the new binary: the data (v1.0's Raft log and snapshots) is read back. A rolling upgrade isn't supported, because v1.0 nodes misread log entries written by newer leaders (newer releases store keys and values as base64, which v1.0 would apply literally). v1.0 also has the safety bugs fixed since, so it shouldn't share a cluster with anything.
 - **Keys can't contain whitespace** in the text protocol (values are binary-safe).
