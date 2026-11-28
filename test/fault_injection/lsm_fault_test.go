@@ -15,7 +15,7 @@ import (
 
 // opAt must match op() in lsmwriter/main.go.
 func opAt(i int) (key, val string, del bool) {
-	return fmt.Sprintf("key-%02d", i%40), fmt.Sprintf("val-%04d", i), i%7 == 3
+	return fmt.Sprintf("key-%03d", i%400), fmt.Sprintf("val-%04d", i), i%7 == 3
 }
 
 // model returns the expected state after the first n operations.
@@ -47,7 +47,7 @@ func TestLSMFaultInjection(t *testing.T) {
 		t.Fatalf("build lsmwriter: %v\n%s", err, out)
 	}
 
-	const trials, ops = 15, 600
+	const trials, ops = 15, 2000
 	for trial := 0; trial < trials; trial++ {
 		dir := filepath.Join(t.TempDir(), fmt.Sprintf("trial-%d", trial))
 		cmd := exec.Command(bin, dir, fmt.Sprint(ops))
@@ -64,19 +64,19 @@ func TestLSMFaultInjection(t *testing.T) {
 				fmt.Sscanf(sc.Text(), "DONE %d", &acked)
 			}
 		}()
-		time.Sleep(time.Duration(rand.Intn(120)) * time.Millisecond)
+		time.Sleep(time.Duration(rand.Intn(450)) * time.Millisecond)
 		cmd.Process.Signal(syscall.SIGKILL)
 		cmd.Wait()
 		<-done
 
-		e, err := lsm.Open(dir)
+		e, err := lsm.OpenWithOptions(dir, lsm.Options{MemTableSize: 2048, TargetFileSize: 1024, LevelSizeBase: 4096})
 		if err != nil {
 			t.Fatalf("trial %d: recovery failed: %v", trial, err)
 		}
 		matches := func(n int) bool {
 			want := model(n)
-			for i := 0; i < 40; i++ {
-				k := fmt.Sprintf("key-%02d", i)
+			for i := 0; i < 400; i++ {
+				k := fmt.Sprintf("key-%03d", i)
 				v, ok := e.Get([]byte(k))
 				wv, wok := want[k]
 				if ok != wok || string(v) != wv {

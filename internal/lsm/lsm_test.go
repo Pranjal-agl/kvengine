@@ -168,7 +168,7 @@ func TestSSTableFileCountBounded(t *testing.T) {
 		}
 		e.Flush()
 		e.mu.Lock()
-		if len(e.l0) >= maxL0Tables {
+		if len(e.levels[0]) >= maxL0Tables {
 			e.compact()
 		}
 		e.mu.Unlock()
@@ -413,5 +413,33 @@ func BenchmarkLSMGetMiss(b *testing.B) {
 		if _, ok := e.Get([]byte(fmt.Sprintf("k%07d", (i*2+1)%60000))); ok {
 			b.Fatal("found an absent key")
 		}
+	}
+}
+
+// BenchmarkLSMWriteAmplification loads N unique keys (~27 bytes each) in a
+// scattered order and reports SSTable bytes written per user byte. With a
+// two-level design it grows linearly with N; with leveled compaction it
+// grows roughly with the number of levels (log N).
+func BenchmarkLSMWriteAmplification(b *testing.B) {
+	for _, n := range []int{200000, 600000, 1800000} {
+		b.Run(fmt.Sprintf("keys=%d", n), func(b *testing.B) { benchWriteAmp(b, n) })
+	}
+}
+
+func benchWriteAmp(b *testing.B, n int) {
+	for i := 0; i < b.N; i++ {
+		dir := b.TempDir()
+		// Level sizes scaled with the small memtable, in LevelDB's
+		// proportions (L1 budget ~ one L0 compaction's worth of input).
+		e, _ := OpenWithOptions(dir, Options{MemTableSize: 256 << 10, TargetFileSize: 256 << 10,
+			LevelSizeBase: 1 << 20, NoSync: true})
+		userBytes := 0
+		for k := 0; k < n; k++ {
+			key, val := fmt.Sprintf("key-%08d", (k*7919)%n), "value-padding-value"
+			userBytes += len(key) + len(val)
+			e.Put([]byte(key), []byte(val))
+		}
+		e.Close()
+		b.ReportMetric(float64(e.bytesWritten)/float64(userBytes), "write-amp")
 	}
 }

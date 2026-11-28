@@ -40,7 +40,7 @@ func TestBloomSkipsTablesOnMiss(t *testing.T) {
 	e.mu.RLock()
 	for i := 1; i < 6000; i += 2 {
 		k := fmt.Sprintf("k%07d", i)
-		for _, sst := range e.l0 {
+		for _, sst := range e.levels[0] {
 			total++
 			if !sst.filter.mayContain(k) {
 				skipped++

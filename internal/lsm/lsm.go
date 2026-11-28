@@ -296,6 +296,12 @@ type Options struct {
 	// OS before returning, so they survive a process crash, but the most
 	// recent ones can be lost on power failure or kernel crash.
 	NoSync bool
+	// TargetFileSize is the approximate size of each SSTable written by
+	// compaction into levels 1 and below. Default 2 MiB.
+	TargetFileSize int
+	// LevelSizeBase is the byte budget of L1; each deeper level gets 10x
+	// the previous one. Default 10 MiB.
+	LevelSizeBase int
 }
 
 // Engine is the top-level LSM storage engine. Safe for concurrent use.
@@ -319,10 +325,17 @@ type Engine struct {
 	dir        string
 	opts       Options
 	memtable   *MemTable
-	l0         []*SSTable // Level 0: recently flushed, oldest first, may overlap
-	l1         []*SSTable // Level 1: output of the last compaction (0 or 1 file)
+	// levels[0] is L0: flushed MemTables, oldest first, may overlap.
+	// levels[1:] are sorted by key with disjoint ranges (levels.go).
+	levels     [numLevels][]*SSTable
+	compactPtr [numLevels]string // round-robin compaction cursor per level
 	nextID     int
 	closed     bool
+
+	manifest      *wal.WAL // live-file log (levels.go)
+	manifestEdits int
+
+	bytesWritten int64 // SSTable bytes written (flushes + compactions)
 
 	wal      *wal.WAL // WAL for the current MemTable
 	walFiles []string // WAL files whose contents are in the current MemTable
@@ -346,15 +359,9 @@ type writeResult struct {
 // burst isn't stuck behind an unbounded batch.
 const maxBatch = 1024
 
-// Open opens the engine in dir, creating it if needed, and reloads any
-// SSTables left by a previous run.
-//
-// Recovery relies on IDs being allocated in increasing order: a compaction
-// always writes its L1 output with a higher ID than every file it merged,
-// and makes it visible (rename) before deleting the inputs. So if a crash
-// interrupts the deletions, any L0 or L1 file with an ID below the newest
-// L1's is a leftover input that has already been merged; Open deletes it.
-//
+// Open opens the engine in dir, creating it if needed, and reloads the
+// SSTables the MANIFEST lists as live (see levels.go); any other SSTable
+// is a leftover from an interrupted flush or compaction and is deleted.
 // WALs left by a crash are replayed in order into the MemTable, which is
 // then flushed so recovery starts from a clean slate.
 func Open(dir string) (*Engine, error) { return OpenWithOptions(dir, Options{}) }
@@ -363,6 +370,12 @@ func Open(dir string) (*Engine, error) { return OpenWithOptions(dir, Options{}) 
 func OpenWithOptions(dir string, opts Options) (*Engine, error) {
 	if opts.MemTableSize <= 0 {
 		opts.MemTableSize = defaultMemTableSize
+	}
+	if opts.TargetFileSize <= 0 {
+		opts.TargetFileSize = defaultTargetFileSize
+	}
+	if opts.LevelSizeBase <= 0 {
+		opts.LevelSizeBase = defaultLevelSizeBase
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("lsm: mkdir: %w", err)
@@ -373,10 +386,8 @@ func OpenWithOptions(dir string, opts Options) (*Engine, error) {
 	if err != nil {
 		return nil, fmt.Errorf("lsm: read dir: %w", err)
 	}
-	type found struct{ level, id int }
-	var files []found
+	files := map[int]int{} // id → level
 	var wals []int
-	newestL1 := -1
 	for _, d := range names {
 		name := d.Name()
 		if strings.HasSuffix(name, ".tmp") {
@@ -392,35 +403,17 @@ func OpenWithOptions(dir string, opts Options) (*Engine, error) {
 			continue
 		}
 		var level, id int
-		if n, _ := fmt.Sscanf(name, "l%d-%d.sst", &level, &id); n != 2 || sstName(level, id) != name {
+		if n, _ := fmt.Sscanf(name, "l%d-%d.sst", &level, &id); n != 2 || sstName(level, id) != name || level >= numLevels {
 			continue
 		}
-		files = append(files, found{level, id})
-		if level == 1 && id > newestL1 {
-			newestL1 = id
-		}
+		files[id] = level
 		if id > e.nextID {
 			e.nextID = id
 		}
 	}
-	sort.Slice(files, func(i, j int) bool { return files[i].id < files[j].id })
-
-	for _, f := range files {
-		path := filepath.Join(dir, sstName(f.level, f.id))
-		if f.id < newestL1 {
-			os.Remove(path) // already merged into the newest L1
-			continue
-		}
-		sst, err := openSSTable(path, f.level, f.id)
-		if err != nil {
-			e.closeTables()
-			return nil, err
-		}
-		if f.level == 1 {
-			e.l1 = append(e.l1, sst)
-		} else {
-			e.l0 = append(e.l0, sst)
-		}
+	if err := e.loadTables(files); err != nil {
+		e.closeTables()
+		return nil, err
 	}
 
 	// Replay WALs oldest first, so later writes win.
@@ -540,8 +533,9 @@ func (e *Engine) commitBatch(batch []*writeReq) error {
 	return e.flushLocked()
 }
 
-// Get looks up key. Search order: MemTable → L0 (newest first) → L1. The
-// first layer that has an entry for key decides the answer.
+// Get looks up key. Search order: MemTable → L0 (newest first) → one file
+// per deeper level. The first layer that has an entry for key decides the
+// answer (a tombstone means "deleted").
 func (e *Engine) Get(key []byte) ([]byte, bool) {
 	v, ok, _ := e.GetErr(key)
 	return v, ok
@@ -559,8 +553,9 @@ func (e *Engine) GetErr(key []byte) ([]byte, bool, error) {
 	if en, ok := e.memtable.data[k]; ok {
 		return result(en)
 	}
-	for i := len(e.l0) - 1; i >= 0; i-- {
-		en, found, err := e.l0[i].get(k)
+	l0 := e.levels[0]
+	for i := len(l0) - 1; i >= 0; i-- {
+		en, found, err := l0[i].get(k)
 		if err != nil {
 			return nil, false, err
 		}
@@ -568,8 +563,12 @@ func (e *Engine) GetErr(key []byte) ([]byte, bool, error) {
 			return result(en)
 		}
 	}
-	for i := len(e.l1) - 1; i >= 0; i-- {
-		en, found, err := e.l1[i].get(k)
+	for lvl := 1; lvl < numLevels; lvl++ {
+		f := findFile(e.levels[lvl], k)
+		if f == nil {
+			continue
+		}
+		en, found, err := f.get(k)
 		if err != nil {
 			return nil, false, err
 		}
@@ -603,7 +602,10 @@ func (e *Engine) flushLocked() error {
 		if err != nil {
 			return err
 		}
-		e.l0 = append(e.l0, sst)
+		e.bytesWritten += sst.size
+		if err := e.applyEdit([]*SSTable{sst}, nil); err != nil {
+			return discard([]*SSTable{sst}, err)
+		}
 		e.memtable = newMemTable()
 		flushed = true
 	}
@@ -614,10 +616,7 @@ func (e *Engine) flushLocked() error {
 			return err
 		}
 	}
-	if len(e.l0) >= maxL0Tables {
-		return e.compact()
-	}
-	return nil
+	return e.maybeCompact()
 }
 
 // rotateWAL opens a fresh WAL for the (now empty) MemTable and deletes the
@@ -636,48 +635,6 @@ func (e *Engine) rotateWAL() error {
 		os.Remove(old)
 	}
 	e.wal, e.walFiles = w, []string{path}
-	return nil
-}
-
-// compact merges all L0 SSTables with L1 into one new L1 SSTable.
-// Called with e.mu held.
-//
-// L1 is the bottom level, so tombstones are dropped here: once merged,
-// there is nothing older left for them to shadow. The output file is
-// written even if empty — its ID is what tells Open that every input with
-// a lower ID is obsolete (see Open).
-func (e *Engine) compact() error {
-	merged := make(map[string]entry)
-	// Oldest to newest, so newer entries overwrite older ones.
-	for _, sst := range append(append([]*SSTable{}, e.l1...), e.l0...) {
-		entries, err := sst.readAll()
-		if err != nil {
-			return fmt.Errorf("lsm: compact: %w", err)
-		}
-		for _, en := range entries {
-			merged[en.key] = en
-		}
-	}
-	entries := make([]entry, 0, len(merged))
-	for _, en := range merged {
-		if !en.deleted {
-			entries = append(entries, en)
-		}
-	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].key < entries[j].key })
-
-	e.nextID++
-	out, err := writeSSTable(e.dir, 1, e.nextID, entries)
-	if err != nil {
-		return fmt.Errorf("lsm: compact write l1: %w", err)
-	}
-	old := append(e.l1, e.l0...)
-	e.l0 = nil
-	e.l1 = []*SSTable{out}
-	for _, sst := range old {
-		sst.close()
-		os.Remove(sst.path)
-	}
 	return nil
 }
 
@@ -720,11 +677,13 @@ func (e *Engine) Close() error {
 }
 
 func (e *Engine) closeTables() {
-	for _, sst := range e.l0 {
-		sst.close()
+	for lvl := range e.levels {
+		for _, sst := range e.levels[lvl] {
+			sst.close()
+		}
 	}
-	for _, sst := range e.l1 {
-		sst.close()
+	if e.manifest != nil {
+		e.manifest.Close()
 	}
 }
 
@@ -732,10 +691,17 @@ func (e *Engine) closeTables() {
 func (e *Engine) Stats() map[string]interface{} {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
+	files, bytes := make([]int, numLevels), make([]int64, numLevels)
+	for lvl := range e.levels {
+		files[lvl], bytes[lvl] = len(e.levels[lvl]), levelBytes(e.levels[lvl])
+	}
 	return map[string]interface{}{
 		"memtable_bytes": e.memtable.size,
-		"l0_files":       len(e.l0),
-		"l1_files":       len(e.l1),
+		"l0_files":       files[0],
+		"l1_files":       files[1],
+		"level_files":    files,
+		"level_bytes":    bytes,
+		"bytes_written":  e.bytesWritten,
 	}
 }
 

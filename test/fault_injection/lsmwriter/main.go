@@ -1,6 +1,7 @@
 // lsmwriter is a helper process for TestLSMFaultInjection: it applies a
-// deterministic stream of puts and deletes to an LSM engine (with a tiny
-// MemTable, so flushes and compactions happen constantly) and prints
+// deterministic stream of puts and deletes to an LSM engine (with tiny
+// MemTable and level sizes, so flushes and multi-level compactions happen
+// constantly) and prints
 // "DONE <i>" after operation i returns. The parent kills it with SIGKILL at
 // a random point and checks what survived.
 //
@@ -16,9 +17,9 @@ import (
 )
 
 // Op returns operation i of the stream; shared with the test via
-// identical code (keep in sync with opAt in fault_test.go).
+// identical code (keep in sync with opAt in lsm_fault_test.go).
 func op(i int) (key string, val string, del bool) {
-	return fmt.Sprintf("key-%02d", i%40), fmt.Sprintf("val-%04d", i), i%7 == 3
+	return fmt.Sprintf("key-%03d", i%400), fmt.Sprintf("val-%04d", i), i%7 == 3
 }
 
 func main() {
@@ -30,7 +31,9 @@ func main() {
 	if err != nil {
 		os.Exit(2)
 	}
-	e, err := lsm.OpenWithOptions(os.Args[1], lsm.Options{MemTableSize: 2048})
+	// Tiny sizes so flushes, multi-level compactions and manifest edits
+	// are constantly in progress when the kill lands.
+	e, err := lsm.OpenWithOptions(os.Args[1], lsm.Options{MemTableSize: 2048, TargetFileSize: 1024, LevelSizeBase: 4096})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "open:", err)
 		os.Exit(1)
