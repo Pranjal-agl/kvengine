@@ -177,6 +177,7 @@ go test -race -v ./internal/lsm/...
 - `TestCompaction`: merges L0 into L1 correctly; updated keys show the new value, deleted keys are gone
 - `TestSSTableFileCountBounded`: after 20 rounds of writes and flushes, total SSTable file count stays bounded
 - `TestWritesDontWaitForCompaction`, `TestWritesStallAtL0Limit`, `TestCompactionErrorReachesStalledWriters`, `TestReadsDuringBackgroundCompaction`, `TestPickCompactionScoresLevels`, `TestReopenWithFullL0StartsCompacting`: background compaction — writes and reads proceed during a merge, writes stall only at 12 L0 files, a failing compaction surfaces as an error, levels are picked by score, and a reopened engine with a backed-up L0 starts compacting at once
+- `TestRateLimiterPacesAndYieldsWhenUrgent`, `TestCompactionRateLimit`, `TestCloseInterruptsThrottledCompaction`: the compaction rate limit holds, steps aside when L0 backs up, and doesn't hold up Close
 - `TestWritesDontWaitForFlush`, `TestFlushErrorReachesWriters`, `TestFlushRecoversAfterError`, `TestCrashDuringFlush`: background flush of the immutable MemTable — writes continue while it is flushed and reads see it, only the next full MemTable waits, a failing flush surfaces as an error, and a crash mid-flush loses nothing
 
 ### internal/linearcheck

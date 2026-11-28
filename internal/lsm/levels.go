@@ -206,6 +206,7 @@ func (e *Engine) applyEdit(adds, dels []*SSTable) error {
 		files := e.levels[lvl]
 		sort.Slice(files, func(i, j int) bool { return files[i].minKey < files[j].minKey })
 	}
+	e.l0Files.Store(int32(len(e.levels[0])))
 	for _, f := range dels {
 		f.close()
 		os.Remove(f.path)
@@ -460,6 +461,7 @@ func (e *Engine) runCompaction(c *compaction) error {
 	}
 	merged := map[string]entry{}
 	for _, f := range append(append([]*SSTable(nil), c.lower...), c.upper...) {
+		e.compactLim.wait(int(f.size))
 		entries, err := f.readAll()
 		if err != nil {
 			return fmt.Errorf("lsm: compact: %w", err)
@@ -491,7 +493,7 @@ func (e *Engine) runCompaction(c *compaction) error {
 		e.nextID++
 		id := e.nextID
 		e.mu.Unlock()
-		f, err := writeSSTable(e.dir, c.outLevel, id, batch)
+		f, err := writeSSTable(e.dir, c.outLevel, id, batch, e.compactLim)
 		if err != nil {
 			return err
 		}

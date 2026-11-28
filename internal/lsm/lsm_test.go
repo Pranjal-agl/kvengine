@@ -443,10 +443,22 @@ func benchWriteAmp(b *testing.B, n int) {
 // written, and reports Put and Get latency percentiles. With compaction
 // inline, the write that triggers a compaction (and any read behind the
 // engine lock) waits for the whole merge.
+//
+// The limit= variants set Options.CompactionBytesPerSec.
 func BenchmarkLSMLatencyUnderCompaction(b *testing.B) {
+	for _, limit := range []int{0, 32 << 20, 16 << 20, 8 << 20} {
+		name := "limit=none"
+		if limit > 0 {
+			name = fmt.Sprintf("limit=%dMBps", limit>>20)
+		}
+		b.Run(name, func(b *testing.B) { benchLatencyUnderCompaction(b, limit) })
+	}
+}
+
+func benchLatencyUnderCompaction(b *testing.B, limit int) {
 	for i := 0; i < b.N; i++ {
 		e, _ := OpenWithOptions(b.TempDir(), Options{MemTableSize: 256 << 10, TargetFileSize: 256 << 10,
-			LevelSizeBase: 1 << 20, NoSync: true})
+			LevelSizeBase: 1 << 20, NoSync: true, CompactionBytesPerSec: limit})
 		const n = 400000
 		var written atomic.Int64
 		stop := make(chan struct{})
@@ -495,6 +507,7 @@ func BenchmarkLSMLatencyUnderCompaction(b *testing.B) {
 		report("put", putLat)
 		report("get", gets)
 		b.ReportMetric(elapsed.Seconds(), "load-s")
+		b.ReportMetric(float64(e.Stats()["write_stalls"].(int64)), "stalls")
 	}
 }
 

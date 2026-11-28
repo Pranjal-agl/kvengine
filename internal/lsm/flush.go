@@ -82,7 +82,7 @@ func (e *Engine) flushImm() error {
 			return err
 		}
 	}
-	sst, err := writeSSTable(e.dir, 0, id, imm.sorted())
+	sst, err := writeSSTable(e.dir, 0, id, imm.sorted(), nil)
 	if err != nil {
 		return err
 	}

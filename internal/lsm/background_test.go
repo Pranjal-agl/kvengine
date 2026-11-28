@@ -357,3 +357,65 @@ func TestReopenWithFullL0StartsCompacting(t *testing.T) {
 		t.Fatal("write hung after reopen")
 	}
 }
+
+// The compaction rate limit holds: a compaction moving B bytes (read +
+// written) takes at least about B/rate.
+func TestCompactionRateLimit(t *testing.T) {
+	const rate = 256 << 10 // 256 KiB/s
+	opts := tiny()
+	opts.CompactionBytesPerSec = rate
+	var hold atomic.Bool
+	hold.Store(true)
+	opts.compactHook = func() error {
+		if hold.Load() {
+			return errors.New("not yet")
+		}
+		return nil
+	}
+	e, err := OpenWithOptions(t.TempDir(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	for i := 0; l0Files(e) < maxL0Tables; i++ {
+		e.Put([]byte(fmt.Sprintf("k%05d", i)), []byte("0123456789abcdef0123456789abcdef"))
+	}
+	e.Flush()
+	hold.Store(false)
+	before := e.bytesWritten.Load()
+	e.mu.RLock()
+	in := levelBytes(e.levels[0])
+	e.mu.RUnlock()
+	start := time.Now()
+	if err := e.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	took := time.Since(start)
+	moved := in + (e.bytesWritten.Load() - before)
+	min := time.Duration(float64(moved) / rate * float64(time.Second))
+	t.Logf("moved %d bytes in %v (limit implies >= %v)", moved, took, min)
+	if took < min*8/10 {
+		t.Fatalf("compaction moved %d bytes in %v; at %d B/s it should take ~%v", moved, took, rate, min)
+	}
+}
+
+// Closing doesn't wait out a throttled compaction.
+func TestCloseInterruptsThrottledCompaction(t *testing.T) {
+	opts := tiny()
+	opts.CompactionBytesPerSec = 1 // absurdly slow
+	e, err := OpenWithOptions(t.TempDir(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; l0Files(e) < maxL0Tables; i++ {
+		e.Put([]byte(fmt.Sprintf("k%05d", i)), []byte("0123456789abcdef"))
+	}
+	time.Sleep(50 * time.Millisecond) // the compaction starts and throttles
+	start := time.Now()
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("Close took %v behind a throttled compaction", d)
+	}
+}

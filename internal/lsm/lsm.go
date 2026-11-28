@@ -49,6 +49,10 @@ const (
 	// can't degrade without bound when writes outpace compaction. LevelDB
 	// uses the same 4/12 thresholds.
 	l0StopWrites = 3 * maxL0Tables
+	// l0SlowdownTables: from this many L0 files on, compaction is falling
+	// behind, so it ignores CompactionBytesPerSec until it catches up —
+	// better to spend the I/O than to let writes reach l0StopWrites.
+	l0SlowdownTables = 2 * maxL0Tables
 	// compactRetryDelay: after a failed background compaction (disk full,
 	// I/O error), wait this long before retrying.
 	compactRetryDelay = time.Second
@@ -133,15 +137,21 @@ type indexEntry struct {
 func sstName(level, id int) string { return fmt.Sprintf("l%d-%06d.sst", level, id) }
 
 // writeSSTable atomically writes entries (which must be sorted) to a new
-// SSTable file and returns it opened for reading.
-func writeSSTable(dir string, level, id int, entries []entry) (*SSTable, error) {
+// SSTable file and returns it opened for reading. lim, if not nil, paces
+// the writes (compaction rate limit).
+func writeSSTable(dir string, level, id int, entries []entry, lim *rateLimiter) (*SSTable, error) {
 	path := filepath.Join(dir, sstName(level, id))
 	tmp := path + ".tmp"
 	f, err := os.Create(tmp)
 	if err != nil {
 		return nil, fmt.Errorf("lsm: create sstable: %w", err)
 	}
-	w := bufio.NewWriter(f)
+	var w *bufio.Writer
+	if lim != nil {
+		w = bufio.NewWriterSize(limitedWriter{f, lim}, 64<<10)
+	} else {
+		w = bufio.NewWriter(f)
+	}
 	for _, e := range entries {
 		if err := writeEntry(w, e); err != nil {
 			f.Close()
@@ -324,6 +334,15 @@ type Options struct {
 	compactHook func() error
 	// flushHook is the same for background flushes.
 	flushHook func() error
+
+	// CompactionBytesPerSec caps the bytes compaction reads plus writes per
+	// second while it has slack, so it takes a bounded share of the disk
+	// and CPU and foreground latency stays lower. Once L0 reaches
+	// l0SlowdownTables files compaction is falling behind and runs
+	// unthrottled until it catches up, so the limit never by itself drives
+	// writes into the L0 stall. 0 (the default) means no limit. Flushes
+	// aren't limited: they have to keep up with writes.
+	CompactionBytesPerSec int
 }
 
 // Engine is the top-level LSM storage engine. Safe for concurrent use.
@@ -383,6 +402,8 @@ type Engine struct {
 	stopCh      chan struct{}
 	compactDone chan struct{}
 	flushDone   chan struct{}
+	compactLim  *rateLimiter // nil: unlimited
+	l0Files     atomic.Int32 // len(levels[0]), readable without mu (rate limiter)
 
 	wal      *wal.WAL // WAL for the current MemTable
 	walFiles []string // WAL files whose contents are in the current MemTable
@@ -440,6 +461,8 @@ func OpenWithOptions(dir string, opts Options) (*Engine, error) {
 		flushDone:   make(chan struct{}),
 	}
 	e.bgCond = sync.NewCond(&e.mu)
+	e.compactLim = newRateLimiter(opts.CompactionBytesPerSec, e.stopCh,
+		func() bool { return e.l0Files.Load() >= l0SlowdownTables })
 
 	names, err := os.ReadDir(dir)
 	if err != nil {
@@ -474,6 +497,7 @@ func OpenWithOptions(dir string, opts Options) (*Engine, error) {
 		e.closeTables()
 		return nil, err
 	}
+	e.l0Files.Store(int32(len(e.levels[0])))
 
 	// Replay WALs oldest first, so later writes win.
 	sort.Ints(wals)
