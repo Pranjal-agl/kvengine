@@ -29,6 +29,11 @@ func codecSamples() []any {
 		InstallSnapshotArgs{Term: 5, LeaderId: "L", Data: []byte{}, Config: Membership{}},
 		InstallSnapshotArgs{Term: 5, LeaderId: "L"}, // nil data, nil config
 		InstallSnapshotReply{Term: 8},
+		snapshotChunkArgs{Term: 5, LeaderId: "L", LastIncludedIndex: 100, LastIncludedTerm: 4,
+			Data: []byte{1, 2, 3}, Config: Membership{"a": "h:1"}, Offset: 1 << 33, More: true},
+		snapshotChunkArgs{Term: 5, LeaderId: "L", Offset: 9},
+		snapshotChunkReply{Term: 8, Next: 1 << 20, Done: true},
+		snapshotChunkReply{Term: 8},
 		ReadIndexArgs{From: "f"},
 		ReadIndexReply{Index: 12, OK: true, LeaderId: "L"},
 	}
@@ -80,7 +85,8 @@ func FuzzDecodeRPC(f *testing.F) {
 	f.Add([]byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01})
 	f.Fuzz(func(t *testing.T, b []byte) {
 		targets := []any{&RequestVoteArgs{}, &RequestVoteReply{}, &AppendEntriesArgs{}, &AppendEntriesReply{},
-			&InstallSnapshotArgs{}, &InstallSnapshotReply{}, &ReadIndexArgs{}, &ReadIndexReply{}}
+			&InstallSnapshotArgs{}, &InstallSnapshotReply{}, &ReadIndexArgs{}, &ReadIndexReply{},
+			&snapshotChunkArgs{}, &snapshotChunkReply{}}
 		for _, p := range targets {
 			if decodeRPC(b, p) != nil {
 				continue

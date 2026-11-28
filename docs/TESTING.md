@@ -132,6 +132,7 @@ go test -race -v -timeout 60s ./internal/raft/...
 - `TestAddServer`, `TestRemoveFollower`, `TestRemoveLeader`, `TestOneMembershipChangeAtATime`: membership changes, including that a removed node can't disrupt the cluster and a removed leader steps down only once its removal commits
 - `TestUncommittedConfigRevertsOnTruncation`, `TestMembershipSurvivesSnapshotsAndRestart`, `TestRequestVoteIgnoredWhileLeaderAlive`, `TestEvenSplitHasNoQuorum`, `TestReadIndexSkipsConfigEntries`
 - `TestAddUnreachableServerDoesNotStallCluster`, `TestAddServerWaitsUntilCaughtUp`, `TestAddServerFailsWhenLeaderChanges`: AddServer catches a new server up as a non-voting learner first; one that never catches up is dropped with membership unchanged, and the cluster keeps committing meanwhile
+- `TestChunkedSnapshotTransfer`, `TestChunkedSnapshotResumesAfterFailure`, `TestChunkedSnapshotFallsBackToWholeForOldPeers`, `TestFollowerReassemblesChunks`, `TestTCPTransportChunksAgainstOldPeer`, `TestTCPTransportCarriesChunks`: chunked InstallSnapshot — contiguous 1 MiB chunks, resume after a failure, reassembly rules, and the whole-snapshot fallback for older peers
 - `TestLeaderWithoutQuorumStepsDown`: a leader that reaches only a minority steps down (CheckQuorum) so the majority can elect a new one
 - `TestMembershipChaos`: random membership changes, partitions, crashes and restarts under load; Election Safety checked continuously, State Machine Safety at the end
 - `TestCodecRoundTrip`, `TestCodecRejectsTruncationAndTrailingBytes`, `FuzzDecodeRPC`, `TestTCPTransportAnswersLegacyJSON`, `TestTCPTransportFallsBackToJSONForOldPeers`: the binary codec and rolling-upgrade compatibility
@@ -201,7 +202,7 @@ bash scripts/e2e/run.sh failover membership   # some of them
 |---|---|
 | `failover` | SIGKILL the leader: a new one is elected (~0.5 s), no acknowledged write is lost, followers reject writes and name the leader, the old leader catches up when restarted |
 | `binary_values` | CRLF, NUL, high bytes, empty and 256 KB values survive Raft, snapshots and a full restart |
-| `snapshot_catchup` | A node down for 300 writes (snapshots every 10) catches up via InstallSnapshot |
+| `snapshot_catchup` | A node down for 300 writes (snapshots every 10) catches up via InstallSnapshot; the ~3 MB snapshot goes over in 1 MiB chunks |
 | `clean_shutdown` | SIGINT and SIGTERM exit 0 promptly and log `shutdown complete`; data is intact afterwards |
 | `follower_reads` | Linearizable follower reads see each write acknowledged just before them; with the leader frozen (SIGSTOP) they fail within the read timeout, while `--stale-reads` still answers |
 | `membership` | `--join` + `ADDNODE`, kill the leader, `REMOVENODE` it, add another node, then restart every node with no `--peers` at all (membership comes from disk) |

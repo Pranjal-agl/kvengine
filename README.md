@@ -133,6 +133,7 @@ make e2e                 # real processes: failover, membership, crashes, v1.0 m
 | `internal/raftkv` | `TestLinearizableHistory`, `TestDeposedLeaderCannotServeStaleRead` | Concurrent writes + reads from every node form a linearizable history; a partitioned ex-leader refuses reads |
 | `internal/raft` | `TestMembershipChaos`, `TestEvenSplitHasNoQuorum` | Random adds/removes/partitions/crashes never produce two leaders in a term or divergent logs; a 2/2 split commits nothing |
 | `internal/raft` | `TestAddUnreachableServerDoesNotStallCluster`, `TestAddServerWaitsUntilCaughtUp` | A new server is caught up as a non-voting learner before it joins the majority; one that never answers is given up on without touching membership |
+| `internal/raft` | `TestChunkedSnapshotTransfer`, `TestChunkedSnapshotResumesAfterFailure`, `TestFollowerReassemblesChunks` | Large snapshots go in 1 MiB chunks, arrive intact, and resume after a failed chunk instead of starting over; older peers still get them whole |
 | `internal/raftkv` | `TestFollowerCatchesUpAfterLargeBacklog`, `TestFollowerCatchesUpWithLargeSnapshot` | A follower 40 MB behind catches up via the log or a snapshot |
 | `internal/lsm` | `TestLSMMatchesModel`, `TestLeveledCompactionInvariants` | Random ops, crashes and reopens agree with a map; levels stay sorted, disjoint and within budget |
 | `test/fault_injection` | `TestStoreCompactionFaultInjection` | SIGKILL during WAL compaction (rewrite + rename) never loses an acknowledged write |
@@ -195,7 +196,7 @@ Keys are whitespace-delimited text. Values are length-prefixed binary, so arbitr
 ## Known gaps and deliberate choices
 
 - **No leader leases.** Linearizable reads confirm leadership with a quorum heartbeat round (~15 us on loopback; concurrent reads share one). Leases would skip that round trip, but they are only safe if clocks never drift more than the lease margin; the project chooses the check that doesn't depend on clocks.
-- **Snapshots are whole and in memory.** The state machine is an in-memory map, and snapshots are built, stored and sent as one piece (up to 2 GiB on the wire), not streamed in chunks. Data must fit in RAM in Raft mode.
+- **Snapshots are in memory.** The state machine is an in-memory map, so data must fit in RAM in Raft mode, and a snapshot is built and stored as one piece (and reassembled in memory on a follower). On the wire, snapshots over 1 MiB go in 1 MiB chunks, and an interrupted transfer resumes where it stopped.
 - **No leadership transfer.** Removing the leader makes it step down once the change commits, and the rest elect a new one after an election timeout, instead of the leader handing over to a caught-up follower first.
 - **LSM flushes run on the writer** that fills the MemTable (compaction runs in the background). That write waits for one MemTable's worth of SSTable write, bounded by `MemTableSize`; readers don't. Production engines flush an immutable MemTable in the background too.
 - **The WAL store can't compact while replicating** (legacy leader/follower mode streams the log by byte offset).

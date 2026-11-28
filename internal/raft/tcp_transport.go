@@ -21,6 +21,10 @@ const (
 	rpcAppendEntries   rpcType = 2
 	rpcInstallSnapshot rpcType = 3
 	rpcReadIndex       rpcType = 4
+	// rpcSnapshotChunk: one chunk of a snapshot (InstallSnapshotArgs with
+	// Offset and More). A separate type, so a whole snapshot is still sent
+	// exactly as before and older peers keep understanding it.
+	rpcSnapshotChunk rpcType = 5
 
 	// rpcBinary marks a payload in the binary codec (codec.go). Requests
 	// are always sent binary; the server also still answers JSON requests
@@ -56,9 +60,10 @@ func writeEnvelope(w io.Writer, env rpcEnvelope) error {
 // maxPayload is the largest message accepted for a type: a sanity cap so a
 // corrupt length can't trigger a huge allocation. AppendEntries batches are
 // capped at maxAppendBytes by the sender, so 64 MiB leaves room for one
-// maximum-size value plus encoding overhead. A snapshot carries the whole
-// state machine, which is held in memory anyway, so it gets a far larger
-// cap rather than being split into chunks.
+// maximum-size value plus encoding overhead. Snapshots over
+// snapshotChunkSize are sent as rpcSnapshotChunk messages, which fall under
+// the ordinary cap; a whole snapshot (from an older leader, or a peer that
+// doesn't support chunks) keeps the old 2 GiB cap.
 func maxPayload(t rpcType) uint32 {
 	if t&^rpcBinary == rpcInstallSnapshot {
 		return 2 << 30
@@ -304,7 +309,14 @@ func dispatch(node *Node, env rpcEnvelope) (reply any, ok bool) {
 		if !decode(&args) {
 			return nil, false
 		}
+		args.Offset, args.More = 0, false // this type always carries a whole snapshot
 		return node.HandleInstallSnapshot(args), true
+	case rpcSnapshotChunk:
+		var args snapshotChunkArgs
+		if !decode(&args) {
+			return nil, false
+		}
+		return snapshotChunkReply(node.HandleInstallSnapshot(InstallSnapshotArgs(args))), true
 	case rpcReadIndex:
 		var args ReadIndexArgs
 		if !decode(&args) {
@@ -469,10 +481,28 @@ func (t *TCPTransport) AppendEntries(peer string, args AppendEntriesArgs) (Appen
 	return reply, err
 }
 
+// snapshotChunkArgs and snapshotChunkReply are the wire forms of a chunk
+// and its reply: the same fields, encoded with Offset/More and Next/Done,
+// which the whole-snapshot encoding leaves out for compatibility.
+type (
+	snapshotChunkArgs  InstallSnapshotArgs
+	snapshotChunkReply InstallSnapshotReply
+)
+
 func (t *TCPTransport) InstallSnapshot(peer string, args InstallSnapshotArgs) (InstallSnapshotReply, error) {
-	var reply InstallSnapshotReply
-	err := t.call(peer, rpcInstallSnapshot, args, &reply)
-	return reply, err
+	if args.Offset == 0 && !args.More {
+		var reply InstallSnapshotReply
+		err := t.call(peer, rpcInstallSnapshot, args, &reply)
+		return reply, err
+	}
+	var reply snapshotChunkReply
+	err := t.call(peer, rpcSnapshotChunk, snapshotChunkArgs(args), &reply)
+	if errors.Is(err, errPeerHungUp) {
+		// A fresh connection closed without a reply, in binary and in
+		// JSON: the peer doesn't know this type.
+		return InstallSnapshotReply{}, ErrSnapshotChunksUnsupported
+	}
+	return InstallSnapshotReply(reply), err
 }
 
 func (t *TCPTransport) ReadIndex(peer string, args ReadIndexArgs) (ReadIndexReply, error) {

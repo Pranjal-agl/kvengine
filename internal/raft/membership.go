@@ -213,6 +213,7 @@ func (n *Node) recomputeConfigFrom(from uint64) {
 				delete(n.matchIndex, p)
 				delete(n.ackRound, p)
 				delete(n.snapshotInFlight, p)
+				delete(n.snapshotSent, p)
 			}
 		}
 	}
@@ -347,6 +348,7 @@ func (n *Node) dropPeerState(id string) {
 	delete(n.matchIndex, id)
 	delete(n.ackRound, id)
 	delete(n.snapshotInFlight, id)
+	delete(n.snapshotSent, id)
 	delete(n.lastAck, id)
 }
 

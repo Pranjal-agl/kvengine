@@ -183,6 +183,19 @@ func encodeRPC(v any) ([]byte, error) {
 		encodeMembership(e, m.Config)
 	case InstallSnapshotReply:
 		e.u64(m.Term)
+	case snapshotChunkArgs:
+		e.u64(m.Term)
+		e.str(m.LeaderId)
+		e.u64(m.LastIncludedIndex)
+		e.u64(m.LastIncludedTerm)
+		e.optBytes(m.Data)
+		encodeMembership(e, m.Config)
+		e.u64(m.Offset)
+		e.bool(m.More)
+	case snapshotChunkReply:
+		e.u64(m.Term)
+		e.u64(m.Next)
+		e.bool(m.Done)
 	case ReadIndexArgs:
 		e.str(m.From)
 	case ReadIndexReply:
@@ -242,6 +255,19 @@ func decodeRPC(b []byte, v any) error {
 		m.Config = decodeMembershipBin(d)
 	case *InstallSnapshotReply:
 		m.Term = d.u64()
+	case *snapshotChunkArgs:
+		m.Term = d.u64()
+		m.LeaderId = d.str()
+		m.LastIncludedIndex = d.u64()
+		m.LastIncludedTerm = d.u64()
+		m.Data = d.optBytes()
+		m.Config = decodeMembershipBin(d)
+		m.Offset = d.u64()
+		m.More = d.bool()
+	case *snapshotChunkReply:
+		m.Term = d.u64()
+		m.Next = d.u64()
+		m.Done = d.bool()
 	case *ReadIndexArgs:
 		m.From = d.str()
 	case *ReadIndexReply:

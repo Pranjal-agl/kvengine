@@ -205,6 +205,14 @@ The snapshot file and the state file are written separately, snapshot first. The
 
 **InstallSnapshot.** When a follower's nextIndex is at or below the leader's snapshot, the entries it needs no longer exist, so the leader sends its snapshot instead (at most one in flight per peer). The follower keeps any log suffix that agrees with the snapshot's last entry, discards the rest, and delivers the snapshot to the state machine through `applyCh` (`ApplyMsg.SnapshotValid`). `applyLoop` is the only sender on `applyCh`, so snapshots and commands are always delivered in order.
 
+**Chunks** (paper §7, offset/done). A snapshot used to go as one RPC however large it was. Over TCP each RPC has a 5 s deadline covering the whole request and reply, so a snapshot that couldn't cross the link in 5 s (about 60 MB at 100 Mbit/s) failed on every attempt, and a lagging follower could never catch up. Even when it fit, a dropped connection near the end meant starting again from byte 0. Snapshots over 1 MiB (`snapshotChunkSize`) now go in 1 MiB chunks, each with its `Offset` and a `More` flag (the paper's `done`, inverted so the zero value still means "whole snapshot"):
+
+- The follower reassembles chunks in memory (the state machine holds the whole snapshot in memory anyway) and replies with how many bytes it holds (`Next`). A chunk at a gap gets the offset it should have sent instead. A resend of bytes it already has is taken from that offset. A mid-transfer chunk of a different snapshot gets "start over" but doesn't discard the transfer in progress. The last chunk installs exactly as a whole snapshot did, after checking that the reassembled bytes are valid JSON.
+- The leader sends one chunk at a time, taking the next offset from the follower's reply. On an error it records where it got to (`snapshotSent`), and the transfer started by the next heartbeat resumes there for the same snapshot. A follower that lost its partial copy (it restarted) answers `Next = 0`, and the transfer starts over.
+- Compatibility: a snapshot of 1 MiB or less is still sent as the original whole-snapshot RPC, unchanged on the wire. Chunks use a new message type (`rpcSnapshotChunk`). A peer that predates it hangs up on the unknown type; the transport reports `ErrSnapshotChunksUnsupported`, and the leader sends that peer the snapshot whole for that transfer.
+
+Tests: `TestChunkedSnapshotTransfer` (contiguous chunks of at most 1 MiB, bytes intact), `TestChunkedSnapshotResumesAfterFailure` (fails if the leader restarts from 0), `TestChunkedSnapshotFallsBackToWholeForOldPeers`, `TestFollowerReassemblesChunks` (gaps, resends, stray chunks; fails if the follower ignores offsets), `TestTCPTransportChunksAgainstOldPeer`, `TestTCPTransportCarriesChunks`. The 40 MB `TestFollowerCatchesUpWithLargeSnapshot` and the `snapshot_catchup` e2e scenario (~3 MB, between real processes) now go through chunks, at the same speed as before.
+
 ### The KV state machine (internal/raftkv)
 
 `raftkv.KV` sits between the TCP server and Raft:
@@ -237,7 +245,7 @@ It also found a real bug: after a membership change, the newest committed entry 
 
 RPCs between nodes use a hand-written binary codec (`codec.go`): uvarints, length-prefixed fields, and every length bounds-checked against the remaining input, so garbage can't cause a panic or a huge allocation (`FuzzDecodeRPC`). JSON had been ~25% of CPU on the write path. Binary requests use new type codes. A server still answers JSON requests in JSON, and a client that gets hung up on (which is what older versions do with an unknown type) retries in JSON and remembers that peer, so clusters can be upgraded one node at a time. That was verified with a cluster of two old nodes and one new node, with the new node leading.
 
-AppendEntries batches are capped at 4 MiB of commands. Without the cap, a follower more than 32 MiB behind (the old message limit) received an oversized message on every attempt, never caught up, and campaigned forever. Snapshots get a separate 2 GiB message limit, since they carry the whole state machine.
+AppendEntries batches are capped at 4 MiB of commands. Without the cap, a follower more than 32 MiB behind (the old message limit) received an oversized message on every attempt, never caught up, and campaigned forever. Snapshots over 1 MiB travel in 1 MiB chunks (see Snapshots), within the ordinary limit; a whole snapshot (from an older leader, or to an older peer) keeps the old 2 GiB limit.
 
 ### Linearizable reads: ReadIndex
 

@@ -113,22 +113,26 @@ def binary_values(binary, old):
 @scenario()
 def snapshot_catchup(binary, old):
     """A node down while the others write and snapshot many times catches up
-    through InstallSnapshot when it restarts."""
+    through InstallSnapshot when it restarts. The snapshot is ~3 MB, so it
+    goes over in 1 MiB chunks."""
     c = Cluster(binary, ["n0", "n1", "n2"])
     extra = ["--snapshot-every", "10"]
+    pad = "x" * 8000
     try:
         c.start_all(extra=extra)
         c.leader()
         lagger = next(n for n in c.live() if n is not c.leader())
         lagger.stop()
         for i in range(300):
-            c.put("k%d" % i, "v%d" % i)
+            c.put("k%d" % i, "v%d-%s" % (i, pad))
         c.put("k7", "overwritten")
         lagger.start(peers=c.peers_of(lagger.id), extra=extra)
-        expect_value(lagger, "k299", b"v299", timeout=20)
+        expect_value(lagger, "k299", ("v299-" + pad).encode(), timeout=20)
         expect_value(lagger, "k7", b"overwritten")
-        assert os.path.exists(os.path.join(lagger.data_dir, "raft-snap.json")), \
-            "lagging node has no snapshot on disk"
+        snap = os.path.join(lagger.data_dir, "raft-snap.json")
+        assert os.path.exists(snap), "lagging node has no snapshot on disk"
+        assert os.path.getsize(snap) > 2 << 20, \
+            "snapshot is only %d bytes; the scenario no longer exercises chunking" % os.path.getsize(snap)
     except BaseException:
         c.cleanup(failed=True)
         raise

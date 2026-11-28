@@ -21,6 +21,8 @@
 package raft
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand"
 	"sync"
@@ -32,6 +34,12 @@ import (
 const (
 	// maxAppendBytes bounds the command bytes in one AppendEntries.
 	maxAppendBytes = 4 << 20
+	// snapshotChunkSize: snapshots larger than this are sent in chunks of
+	// this size (Raft paper §7, offset/done), so every RPC stays small and
+	// finishes well inside the transport's per-RPC deadline whatever the
+	// snapshot's size, and an interrupted transfer resumes where it
+	// stopped. Smaller snapshots go whole, in the original single RPC.
+	snapshotChunkSize = 1 << 20
 
 	heartbeatInterval  = 50 * time.Millisecond
 	electionTimeoutMin = 200 * time.Millisecond
@@ -123,16 +131,42 @@ type ReadIndexReply struct {
 	LeaderId string // receiver's view of the leader, as a redirect hint when !OK
 }
 
+// InstallSnapshotArgs carries a snapshot, whole or as one chunk of it.
+// The zero values of Offset and More mean "the whole snapshot", which is
+// also how older versions send it.
 type InstallSnapshotArgs struct {
 	Term              uint64
 	LeaderId          string
 	LastIncludedIndex uint64
 	LastIncludedTerm  uint64
-	Data              []byte
+	Data              []byte     // the snapshot, or bytes [Offset, Offset+len) of it
 	Config            Membership // membership as of LastIncludedIndex
+	Offset            uint64     // byte offset of Data within the snapshot
+	More              bool       // more chunks follow (the paper's done == !More)
 }
 type InstallSnapshotReply struct {
 	Term uint64
+	// For chunks only (whole snapshots need neither):
+	Next uint64 // bytes of this snapshot the follower holds: the offset to send next
+	Done bool   // the follower has this snapshot's state now; stop sending
+}
+
+// ErrSnapshotChunksUnsupported is returned by a Transport whose peer
+// doesn't understand chunked InstallSnapshot (an older version). The
+// leader then sends that peer the snapshot whole.
+var ErrSnapshotChunksUnsupported = errors.New("raft: peer does not support chunked snapshots")
+
+// incomingSnapshot is a chunked snapshot being reassembled by a follower.
+type incomingSnapshot struct {
+	index, term uint64
+	data        []byte
+}
+
+// snapshotProgress is how far the leader got sending a snapshot to a peer,
+// so the next attempt can resume there.
+type snapshotProgress struct {
+	index  uint64
+	offset uint64
 }
 type AppendEntriesReply struct {
 	Term    uint64
@@ -189,12 +223,14 @@ type Node struct {
 	role          Role
 	leaderId      string
 	lastHeartbeat time.Time
-	pendingSnap   *ApplyMsg // installed snapshot not yet delivered to applyCh
+	pendingSnap   *ApplyMsg         // installed snapshot not yet delivered to applyCh
+	incomingSnap  *incomingSnapshot // chunked snapshot being received
 
 	// Leader-only volatile state
 	nextIndex        map[string]uint64
 	matchIndex       map[string]uint64
 	snapshotInFlight map[string]bool
+	snapshotSent     map[string]snapshotProgress // resume point of an interrupted transfer
 	// learners: servers AddServer is catching up before they become
 	// members. They get the log but count toward no majority.
 	learners map[string]bool
@@ -491,6 +527,7 @@ func (n *Node) becomeLeader() {
 	n.nextIndex = make(map[string]uint64, len(n.peers))
 	n.matchIndex = make(map[string]uint64, len(n.peers))
 	n.snapshotInFlight = make(map[string]bool, len(n.peers))
+	n.snapshotSent = map[string]snapshotProgress{}
 	n.ackRound = make(map[string]uint64, len(n.peers))
 	n.lastAck = make(map[string]time.Time, len(n.peers))
 	n.learners = map[string]bool{}
@@ -658,37 +695,81 @@ func (n *Node) sendAppendEntries(peer string) {
 }
 
 // sendInstallSnapshot ships the current snapshot to a peer whose nextIndex
-// is at or below our compaction point. At most one is in flight per peer,
-// since snapshots can be large and heartbeats fire every 50ms.
+// is at or below our compaction point. At most one transfer is in flight
+// per peer, since snapshots can be large and heartbeats fire every 50ms.
 // Called with mu held.
 func (n *Node) sendInstallSnapshot(peer string) {
 	if n.snapshotInFlight[peer] {
 		return
 	}
 	n.snapshotInFlight[peer] = true
-	args := InstallSnapshotArgs{
-		Term:              n.currentTerm,
-		LeaderId:          n.id,
+	snap := Snapshot{
 		LastIncludedIndex: n.snapshotIndex,
 		LastIncludedTerm:  n.snapshotTerm,
-		Data:              n.snapshotData,
+		Data:              n.snapshotData, // never modified in place, so safe to read unlocked
 		Config:            n.baseConfig.clone(),
 	}
-	term := n.currentTerm
-	round := n.hbRound
+	var offset uint64
+	if p, ok := n.snapshotSent[peer]; ok && p.index == snap.LastIncludedIndex {
+		offset = p.offset // resume an interrupted transfer
+	}
+	go n.transferSnapshot(peer, n.currentTerm, snap, offset)
+}
 
-	go func() {
-		reply, err := n.transport.InstallSnapshot(peer, args)
-
-		n.mu.Lock()
-		defer n.mu.Unlock()
-		if n.stopped() {
-			return
-		}
+// transferSnapshot sends snap to peer: whole if it fits in one chunk (or
+// the peer is too old for chunks), else chunk by chunk from offset, each
+// chunk starting where the follower says it got to. Runs without mu,
+// taking it per RPC. On an error, or a chunk that makes no progress, it
+// records where it got to and stops; the next heartbeat starts a new
+// transfer that resumes there.
+func (n *Node) transferSnapshot(peer string, term uint64, snap Snapshot, offset uint64) {
+	whole := len(snap.Data) <= snapshotChunkSize
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	defer func() {
 		if n.currentTerm == term && n.snapshotInFlight != nil {
 			n.snapshotInFlight[peer] = false
 		}
+	}()
+	for {
+		if n.stopped() || n.role != Leader || n.currentTerm != term || !n.replicatesTo(peer) {
+			return
+		}
+		args := InstallSnapshotArgs{
+			Term:              term,
+			LeaderId:          n.id,
+			LastIncludedIndex: snap.LastIncludedIndex,
+			LastIncludedTerm:  snap.LastIncludedTerm,
+			Config:            snap.Config,
+		}
+		if whole {
+			args.Data = snap.Data
+		} else {
+			if offset > uint64(len(snap.Data)) {
+				offset = 0
+			}
+			end := offset + snapshotChunkSize
+			if end > uint64(len(snap.Data)) {
+				end = uint64(len(snap.Data))
+			}
+			args.Offset, args.Data, args.More = offset, snap.Data[offset:end], end < uint64(len(snap.Data))
+		}
+		round := n.hbRound
+		n.mu.Unlock()
+		reply, err := n.transport.InstallSnapshot(peer, args)
+		n.mu.Lock()
+
+		if errors.Is(err, ErrSnapshotChunksUnsupported) && !whole {
+			whole = true // an older peer: send it whole instead
+			continue
+		}
+		if n.stopped() {
+			return
+		}
 		if err != nil {
+			if !whole {
+				n.snapshotSent[peer] = snapshotProgress{snap.LastIncludedIndex, offset}
+			}
 			return
 		}
 		if reply.Term > n.currentTerm {
@@ -699,16 +780,33 @@ func (n *Node) sendInstallSnapshot(peer string) {
 			return
 		}
 		n.recordAck(peer, round)
-		if args.LastIncludedIndex > n.matchIndex[peer] {
-			n.matchIndex[peer] = args.LastIncludedIndex
+		if !whole && !reply.Done {
+			next := reply.Next
+			n.snapshotSent[peer] = snapshotProgress{snap.LastIncludedIndex, next}
+			if next <= args.Offset {
+				// No progress: the follower lost its partial copy (next == 0,
+				// e.g. it restarted) or couldn't install. Let the next
+				// heartbeat retry rather than spinning here.
+				return
+			}
+			offset = next
+			continue
+		}
+		// Installed. (A whole-snapshot reply carries only Term, as it always
+		// has: the follower either installed it or already had its state.)
+		delete(n.snapshotSent, peer)
+		if snap.LastIncludedIndex > n.matchIndex[peer] {
+			n.matchIndex[peer] = snap.LastIncludedIndex
 		}
 		n.nextIndex[peer] = n.matchIndex[peer] + 1
 		n.maybeAdvanceCommitIndex()
 		if n.learners[peer] {
 			n.signal()
 		}
+		n.snapshotInFlight[peer] = false
 		n.sendAppendEntries(peer) // follow up with any entries after the snapshot
-	}()
+		return
+	}
 }
 
 // maybeAdvanceCommitIndex checks whether commitIndex can be advanced: finds
@@ -951,7 +1049,33 @@ func (n *Node) HandleInstallSnapshot(args InstallSnapshotArgs) InstallSnapshotRe
 	// Already have everything this snapshot contains (and it's committed):
 	// installing it would move the state machine backwards.
 	if args.LastIncludedIndex <= n.commitIndex {
-		return InstallSnapshotReply{Term: n.currentTerm}
+		n.incomingSnap = nil
+		return InstallSnapshotReply{Term: n.currentTerm, Done: true}
+	}
+
+	data := args.Data
+	if args.Offset > 0 || args.More {
+		// A chunk. Reassemble in memory (the state machine holds the whole
+		// snapshot in memory anyway); a chunk for a different snapshot, or
+		// out of order, gets the offset we need instead.
+		in := n.incomingSnap
+		if in == nil || in.index != args.LastIncludedIndex || in.term != args.LastIncludedTerm {
+			if args.Offset != 0 {
+				return InstallSnapshotReply{Term: n.currentTerm} // Next 0: start over
+			}
+			in = &incomingSnapshot{index: args.LastIncludedIndex, term: args.LastIncludedTerm}
+			n.incomingSnap = in
+		}
+		if args.Offset > uint64(len(in.data)) {
+			return InstallSnapshotReply{Term: n.currentTerm, Next: uint64(len(in.data))}
+		}
+		// Offset < len is a resend of bytes we have; take it from there.
+		in.data = append(in.data[:args.Offset], args.Data...)
+		if args.More {
+			return InstallSnapshotReply{Term: n.currentTerm, Next: uint64(len(in.data))}
+		}
+		data = in.data
+		n.incomingSnap = nil
 	}
 
 	// If our log has the snapshot's last entry with a matching term, the
@@ -962,10 +1086,15 @@ func (n *Node) HandleInstallSnapshot(args InstallSnapshotArgs) InstallSnapshotRe
 		newLog = append(newLog, n.log[args.LastIncludedIndex-n.snapshotIndex+1:]...)
 	}
 
+	if !json.Valid(data) {
+		// Snapshot data is always JSON (TakeSnapshot checks); anything else
+		// is a reassembly bug or corruption. Don't adopt it.
+		return InstallSnapshotReply{Term: n.currentTerm}
+	}
 	snap := Snapshot{
 		LastIncludedIndex: args.LastIncludedIndex,
 		LastIncludedTerm:  args.LastIncludedTerm,
-		Data:              args.Data,
+		Data:              data,
 		Config:            args.Config,
 	}
 	if err := n.writeSnapshot(snap); err != nil {
@@ -976,7 +1105,7 @@ func (n *Node) HandleInstallSnapshot(args InstallSnapshotArgs) InstallSnapshotRe
 	n.log = newLog
 	n.snapshotIndex = args.LastIncludedIndex
 	n.snapshotTerm = args.LastIncludedTerm
-	n.snapshotData = args.Data
+	n.snapshotData = data
 	if args.Config != nil {
 		n.baseConfig = args.Config.clone()
 	}
@@ -987,12 +1116,12 @@ func (n *Node) HandleInstallSnapshot(args InstallSnapshotArgs) InstallSnapshotRe
 	n.lastApplied = args.LastIncludedIndex
 	n.pendingSnap = &ApplyMsg{
 		SnapshotValid: true,
-		Snapshot:      args.Data,
+		Snapshot:      data,
 		SnapshotIndex: args.LastIncludedIndex,
 		SnapshotTerm:  args.LastIncludedTerm,
 	}
 	n.notifyApply()
-	return InstallSnapshotReply{Term: n.currentTerm}
+	return InstallSnapshotReply{Term: n.currentTerm, Done: true}
 }
 
 // --- Client interface ---
