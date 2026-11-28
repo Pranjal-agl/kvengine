@@ -10,11 +10,13 @@ import (
 
 // crash abandons an engine without Close, as if the process died: nothing
 // is flushed, and only what reached the WAL survives. The background
-// compactor is stopped (a dead process has none), possibly mid-merge.
+// flusher and compactor are stopped (a dead process has neither), possibly
+// mid-flush or mid-merge.
 func crash(e *Engine) {
 	e.stopping.Store(true)
 	close(e.stopCh)
 	<-e.compactDone
+	<-e.flushDone
 }
 
 func reopen(t *testing.T, dir string) *Engine {

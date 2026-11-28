@@ -270,7 +270,7 @@ func (e *Engine) compactLoop() {
 			}
 			e.mu.Lock()
 			e.bgErr = err
-			e.l0Cond.Broadcast()
+			e.bgCond.Broadcast()
 			e.mu.Unlock()
 			if err != nil {
 				e.opts.Logf("lsm: background compaction failed (retrying in %v): %v", compactRetryDelay, err)
@@ -365,6 +365,9 @@ func (e *Engine) plan(upper, lower []*SSTable, outLevel int) *compaction {
 // makes necessary, before returning. Background compaction makes calling
 // it unnecessary; it is for tests and tools that want a settled tree.
 func (e *Engine) Compact() error {
+	if err := e.waitForFlush(); err != nil {
+		return err
+	}
 	e.cmu.Lock()
 	defer e.cmu.Unlock()
 	e.mu.RLock()
@@ -389,6 +392,9 @@ func (e *Engine) Compact() error {
 // outstanding compactions itself rather than waiting for the background
 // goroutine. For tests and benchmarks that check the tree's shape.
 func (e *Engine) WaitForCompactions() error {
+	if err := e.waitForFlush(); err != nil {
+		return err
+	}
 	e.cmu.Lock()
 	defer e.cmu.Unlock()
 	e.mu.RLock()
@@ -398,6 +404,17 @@ func (e *Engine) WaitForCompactions() error {
 		return ErrClosed
 	}
 	return e.settle()
+}
+
+// waitForFlush waits for a pending background flush, so the tree is
+// settled against everything written so far.
+func (e *Engine) waitForFlush() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return ErrClosed
+	}
+	return e.waitImmLocked()
 }
 
 // settle compacts until nothing is over budget. Called with cmu held.
@@ -506,7 +523,7 @@ func (e *Engine) runCompaction(c *compaction) error {
 		return discard(outs, err)
 	}
 	e.compactions.Add(1)
-	e.l0Cond.Broadcast()
+	e.bgCond.Broadcast()
 	return nil
 }
 

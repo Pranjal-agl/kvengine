@@ -113,9 +113,9 @@ func TestWritesStallAtL0Limit(t *testing.T) {
 	defer e.Close()
 	defer g.release() // before Close, which waits for the compactor
 
-	fillL0(t, e, l0StopWrites-1, "a")
-	// One more flush puts L0 at the limit: a write that fills the
-	// MemTable flushes, then must wait. (Flush itself never stalls.)
+	fillL0(t, e, l0StopWrites, "a")
+	// L0 is at the limit: a write that fills the MemTable must wait before
+	// it can swap in a new one. (Flush itself never stalls.)
 	big := make([]byte, opts.MemTableSize)
 	putDone := make(chan error, 1)
 	go func() { putDone <- e.Put([]byte("big"), big) }()
@@ -318,5 +318,42 @@ func TestPickCompactionScoresLevels(t *testing.T) {
 		if got != c.want {
 			t.Errorf("case %d (L0 %d files, L1 %dB, L2 %dB): compacted L%d, want L%d", i, c.l0, c.l1Bytes, c.l2Bytes, got, c.want)
 		}
+	}
+}
+
+// An engine reopened with L0 already backed up compacts straight away. It
+// used to wait for the next flush to wake the compactor, so a write that
+// stalled on L0 waited forever.
+func TestReopenWithFullL0StartsCompacting(t *testing.T) {
+	dir := t.TempDir()
+	opts := tiny()
+	opts.compactHook = func() error { return errors.New("compaction off") }
+	e, err := OpenWithOptions(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; l0Files(e) < l0StopWrites+2; i++ {
+		e.Put([]byte(fmt.Sprintf("k%05d", i)), []byte("v"))
+		if i%20 == 19 {
+			e.Flush()
+		}
+	}
+	e.Close()
+
+	e, err = OpenWithOptions(dir, tiny())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	waitFor(t, func() bool { return l0Files(e) < maxL0Tables }, "compaction to start after reopen")
+	done := make(chan error, 1)
+	go func() { done <- e.Put([]byte("after"), make([]byte, tiny().MemTableSize)) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("write hung after reopen")
 	}
 }

@@ -497,3 +497,28 @@ func BenchmarkLSMLatencyUnderCompaction(b *testing.B) {
 		b.ReportMetric(elapsed.Seconds(), "load-s")
 	}
 }
+
+// BenchmarkLSMDurablePutLatency: one writer, durable (fsync per write),
+// 1 MiB MemTable, 40k ~90-byte writes (several MemTable fills). Reports
+// Put latency percentiles: with the flush on the writer, the write that
+// fills the MemTable also sorts it and writes and fsyncs an SSTable.
+func BenchmarkLSMDurablePutLatency(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		e, _ := OpenWithOptions(b.TempDir(), Options{MemTableSize: 1 << 20})
+		const n = 40000
+		lat := make([]time.Duration, 0, n)
+		val := []byte("value-padding-value-padding-value-padding-value-padding-value-padding-")
+		for k := 0; k < n; k++ {
+			t0 := time.Now()
+			e.Put([]byte(fmt.Sprintf("key-%08d", (k*7919)%n)), val)
+			lat = append(lat, time.Since(t0))
+		}
+		e.Close()
+		sort.Slice(lat, func(i, j int) bool { return lat[i] < lat[j] })
+		pct := func(p float64) float64 { return float64(lat[int(float64(len(lat)-1)*p)].Microseconds()) }
+		b.ReportMetric(pct(0.5), "p50-us")
+		b.ReportMetric(pct(0.999), "p99.9-us")
+		b.ReportMetric(pct(0.9999), "p99.99-us")
+		b.ReportMetric(float64(lat[len(lat)-1].Microseconds()), "max-us")
+	}
+}
