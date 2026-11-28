@@ -36,6 +36,16 @@ import (
 //     can't disrupt the cluster by campaigning (§4.2.3).
 //   - Servers that aren't members never start elections — this is also how
 //     a brand-new server waits, empty, until the leader adds it.
+//
+// Catching up first (thesis §4.2.1): AddServer doesn't add the new server
+// straight away. The leader first replicates to it as a *learner*, which
+// receives the log like a follower but counts toward no majority, and only
+// proposes the change once the learner has caught up. Otherwise a new
+// server that is far behind (or unreachable) joins the majority at once,
+// and commits wait for it — adding one server to a one-node cluster would
+// stall it until the newcomer had the whole log. Learner state is
+// leader-local and volatile; if leadership changes, AddServer fails and
+// the caller retries with the new leader.
 
 // Membership maps member ID to its transport address. An empty address is
 // allowed for in-process transports.
@@ -90,7 +100,21 @@ var (
 	ErrLost = errors.New("raft: entry was overwritten by a new leader")
 	// ErrCommitTimeout: the entry did not commit in time; outcome unknown.
 	ErrCommitTimeout = errors.New("raft: timed out waiting for commit")
+	// ErrCatchUpTimeout: AddServer's new server didn't catch up with the
+	// leader's log in time (unreachable, or too slow). Membership is
+	// unchanged.
+	ErrCatchUpTimeout = errors.New("raft: new server did not catch up in time")
 )
+
+// DefaultCatchUpTimeout bounds how long AddServer replicates to a new
+// server before giving up.
+const DefaultCatchUpTimeout = 2 * time.Minute
+
+// catchUpRound: a learner is caught up once a replication round — bringing
+// it up to the leader's last index as of the round's start — takes less
+// than this. Then the entries that arrived during the round are few enough
+// to replicate within about one election timeout (thesis §4.2.1).
+const catchUpRound = electionTimeoutMax
 
 // peerAddrSetter is implemented by transports that need addresses for
 // members they weren't constructed with (TCPTransport).
@@ -102,6 +126,12 @@ type peerAddrSetter interface {
 func (n *Node) isMember(id string) bool {
 	_, ok := n.config[id]
 	return ok
+}
+
+// replicatesTo reports whether a leader sends the log to id: a member, or a
+// learner being caught up by AddServer. Called with mu held.
+func (n *Node) replicatesTo(id string) bool {
+	return n.isMember(id) || n.learners[id]
 }
 
 // configAt returns the configuration in effect at absolute index i (the
@@ -178,11 +208,12 @@ func (n *Node) recomputeConfigFrom(from uint64) {
 			}
 		}
 		for p := range n.nextIndex {
-			if !n.isMember(p) {
+			if !n.replicatesTo(p) {
 				delete(n.nextIndex, p)
 				delete(n.matchIndex, p)
 				delete(n.ackRound, p)
 				delete(n.snapshotInFlight, p)
+				delete(n.snapshotSent, p)
 			}
 		}
 	}
@@ -209,21 +240,116 @@ func (n *Node) Members() Membership {
 	return n.config.clone()
 }
 
-// AddServer proposes adding id (reachable at addr) as a voting member.
-// Returns the log index and term of the config entry; use WaitCommitted to
-// wait for it. Adding an existing member with the same address is a no-op
-// that returns the current commit point.
+// AddServer adds id (reachable at addr) as a voting member, catching it up
+// first with DefaultCatchUpTimeout; see AddServerTimeout.
 func (n *Node) AddServer(id, addr string) (uint64, uint64, error) {
+	return n.AddServerTimeout(id, addr, DefaultCatchUpTimeout)
+}
+
+// AddServerTimeout replicates the log to id as a non-voting learner until
+// it has caught up, then proposes adding it as a voting member. It returns
+// the log index and term of the config entry; use WaitCommitted to wait
+// for that. If id hasn't caught up within catchUp, it returns
+// ErrCatchUpTimeout and membership is unchanged. Adding an existing member
+// with the same address is a no-op that returns the current commit point;
+// changing an existing member's address skips the catch-up.
+//
+// Only one membership change can be in progress, including the catch-up:
+// a concurrent AddServer or RemoveServer gets ErrConfigChangeInProgress.
+func (n *Node) AddServerTimeout(id, addr string, catchUp time.Duration) (uint64, uint64, error) {
 	if id == "" {
 		return 0, 0, errors.New("raft: empty server id")
 	}
-	return n.changeConfig(func(m Membership) bool {
+	add := func(m Membership) bool {
 		if cur, ok := m[id]; ok && cur == addr {
 			return false
 		}
 		m[id] = addr
 		return true
-	})
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if err := n.canChangeConfig(); err != nil {
+		return 0, 0, err
+	}
+	if n.isMember(id) {
+		return n.changeConfigLocked(add)
+	}
+	term := n.currentTerm
+	n.startLearner(id, addr)
+	err := n.catchUp(id, term, time.Now().Add(catchUp))
+	if n.currentTerm == term && n.role == Leader {
+		delete(n.learners, id)
+	}
+	if err != nil {
+		n.dropPeerState(id)
+		return 0, 0, err
+	}
+	idx, t, err := n.changeConfigLocked(add)
+	if err != nil {
+		n.dropPeerState(id)
+	}
+	return idx, t, err
+}
+
+// startLearner begins replicating to id without counting it toward any
+// majority. Called with mu held, as leader.
+func (n *Node) startLearner(id, addr string) {
+	if s, ok := n.transport.(peerAddrSetter); ok && addr != "" {
+		s.SetPeerAddrs(Membership{id: addr})
+	}
+	n.learners[id] = true
+	n.nextIndex[id] = n.lastIndex() + 1
+	n.matchIndex[id] = 0
+	n.sendAppendEntries(id)
+}
+
+// catchUp waits, in rounds, until learner id is caught up: each round
+// waits for it to reach the leader's last index as of the round's start,
+// and a round that takes less than catchUpRound means it's caught up.
+// Called with mu held (released while waiting); returns with mu held.
+func (n *Node) catchUp(id string, term uint64, deadline time.Time) error {
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	for {
+		target, start := n.lastIndex(), time.Now()
+		for n.matchIndex[id] < target {
+			if n.stopped() {
+				return ErrStopped
+			}
+			if n.role != Leader || n.currentTerm != term {
+				return &NotLeaderError{LeaderId: n.leaderId}
+			}
+			if !time.Now().Before(deadline) {
+				return fmt.Errorf("%w (%s reached index %d of %d)", ErrCatchUpTimeout, id, n.matchIndex[id], target)
+			}
+			ch := n.changed
+			n.mu.Unlock()
+			select {
+			case <-ch:
+			case <-timer.C:
+			case <-n.stopCh:
+			}
+			n.mu.Lock()
+		}
+		if time.Since(start) < catchUpRound {
+			return nil
+		}
+	}
+}
+
+// dropPeerState forgets a leader's replication state for id, unless id is
+// a member or learner. Called with mu held.
+func (n *Node) dropPeerState(id string) {
+	if n.role != Leader || n.replicatesTo(id) {
+		return
+	}
+	delete(n.nextIndex, id)
+	delete(n.matchIndex, id)
+	delete(n.ackRound, id)
+	delete(n.snapshotInFlight, id)
+	delete(n.snapshotSent, id)
+	delete(n.lastAck, id)
 }
 
 // RemoveServer proposes removing id from the cluster. Removing the leader
@@ -241,11 +367,33 @@ func (n *Node) RemoveServer(id string) (uint64, uint64, error) {
 func (n *Node) changeConfig(mutate func(Membership) bool) (uint64, uint64, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	if err := n.canChangeConfig(); err != nil {
+		return 0, 0, err
+	}
+	return n.changeConfigLocked(mutate)
+}
+
+// canChangeConfig checks the preconditions for starting a membership
+// change. Called with mu held.
+func (n *Node) canChangeConfig() error {
 	if n.stopped() || n.role != Leader {
-		return 0, 0, &NotLeaderError{LeaderId: n.leaderId}
+		return &NotLeaderError{LeaderId: n.leaderId}
 	}
 	if n.termAt(n.commitIndex) != n.currentTerm {
-		return 0, 0, ErrLeaderNotReady
+		return ErrLeaderNotReady
+	}
+	if n.configIndex > n.commitIndex || len(n.learners) > 0 {
+		return ErrConfigChangeInProgress
+	}
+	return nil
+}
+
+// changeConfigLocked appends the configuration mutate produces. Called with
+// mu held, after canChangeConfig. AddServer releases mu while catching up,
+// so leadership and the in-flight rule are checked again here.
+func (n *Node) changeConfigLocked(mutate func(Membership) bool) (uint64, uint64, error) {
+	if n.stopped() || n.role != Leader {
+		return 0, 0, &NotLeaderError{LeaderId: n.leaderId}
 	}
 	if n.configIndex > n.commitIndex {
 		return 0, 0, ErrConfigChangeInProgress

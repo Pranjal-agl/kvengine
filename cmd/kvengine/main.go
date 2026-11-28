@@ -17,6 +17,7 @@
 //	              --raft-addr <host:raftport> \
 //	              --kv-addr <host:kvport> \
 //	              --data-dir <dir> [--snapshot-every N] [--stale-reads] [--join]
+//	              [--catch-up-timeout 2m]
 //
 //	# Grow or shrink a running cluster (send to any node; it must reach the leader):
 //	#   start the new node with --join, then on the leader:
@@ -155,6 +156,7 @@ func runRaft(args []string) {
 	snapEvery := fs.Int("snapshot-every", 1000, "take a Raft snapshot after this many applied writes (0 = never)")
 	staleReads := fs.Bool("stale-reads", false, "serve GETs from local state without a read index (faster, may be stale)")
 	join := fs.Bool("join", false, "start empty and wait to be added to an existing cluster (ADDNODE on its leader); --peers is not needed")
+	catchUp := fs.Duration("catch-up-timeout", raft.DefaultCatchUpTimeout, "how long ADDNODE replicates to a new node, as a non-voter, before giving up on it")
 	fs.Parse(args)
 
 	if *id == "" || *raftAddr == "" {
@@ -201,7 +203,7 @@ func runRaft(args []string) {
 	if err != nil {
 		fatal("raft node:", err)
 	}
-	kv, err := raftkv.New(node, applyCh, raftkv.Options{SnapshotEvery: *snapEvery, StaleReads: *staleReads})
+	kv, err := raftkv.New(node, applyCh, raftkv.Options{SnapshotEvery: *snapEvery, StaleReads: *staleReads, CatchUpTimeout: *catchUp})
 	if err != nil {
 		fatal("raft kv:", err)
 	}
@@ -268,6 +270,8 @@ Raft cluster node:
   Membership changes (one at a time, sent to the leader's KV port):
     start the new node with --join (no --peers needed), then
     ADDNODE <id> <raftAddr> | REMOVENODE <id> | MEMBERS
+    ADDNODE first catches the new node up as a non-voter, and fails
+    (leaving membership unchanged) if that takes over --catch-up-timeout.
 
   Example — 3-node cluster on localhost:
     Terminal 1: kvengine raft --id n0 --raft-addr :7000 --kv-addr :6380 \

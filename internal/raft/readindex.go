@@ -76,9 +76,30 @@ func (n *Node) ReadIndex(timeout time.Duration) (uint64, error) {
 	if leader == "" {
 		return 0, &NotLeaderError{}
 	}
-	reply, err := n.transport.ReadIndex(leader, ReadIndexArgs{From: n.id})
-	if err != nil {
-		return 0, fmt.Errorf("raft: read index from leader %s: %w", leader, err)
+	// The transport has its own RPC timeout (and may retry on a fresh
+	// connection), which can be far longer than the caller's. A leader that
+	// is frozen rather than dead keeps its TCP connections open, so without
+	// this the read would block for the transport's timeout, not ours.
+	type result struct {
+		reply ReadIndexReply
+		err   error
+	}
+	done := make(chan result, 1) // buffered: the RPC may finish after we give up
+	go func() {
+		reply, err := n.transport.ReadIndex(leader, ReadIndexArgs{From: n.id})
+		done <- result{reply, err}
+	}()
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	var reply ReadIndexReply
+	select {
+	case r := <-done:
+		if r.err != nil {
+			return 0, fmt.Errorf("raft: read index from leader %s: %w", leader, r.err)
+		}
+		reply = r.reply
+	case <-timer.C:
+		return 0, fmt.Errorf("raft: read index from leader %s: %w", leader, ErrReadTimeout)
 	}
 	if !reply.OK {
 		return 0, &NotLeaderError{LeaderId: reply.LeaderId}

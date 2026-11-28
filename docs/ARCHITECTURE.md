@@ -205,6 +205,14 @@ The snapshot file and the state file are written separately, snapshot first. The
 
 **InstallSnapshot.** When a follower's nextIndex is at or below the leader's snapshot, the entries it needs no longer exist, so the leader sends its snapshot instead (at most one in flight per peer). The follower keeps any log suffix that agrees with the snapshot's last entry, discards the rest, and delivers the snapshot to the state machine through `applyCh` (`ApplyMsg.SnapshotValid`). `applyLoop` is the only sender on `applyCh`, so snapshots and commands are always delivered in order.
 
+**Chunks** (paper §7, offset/done). A snapshot used to go as one RPC however large it was. Over TCP each RPC has a 5 s deadline covering the whole request and reply, so a snapshot that couldn't cross the link in 5 s (about 60 MB at 100 Mbit/s) failed on every attempt, and a lagging follower could never catch up. Even when it fit, a dropped connection near the end meant starting again from byte 0. Snapshots over 1 MiB (`snapshotChunkSize`) now go in 1 MiB chunks, each with its `Offset` and a `More` flag (the paper's `done`, inverted so the zero value still means "whole snapshot"):
+
+- The follower reassembles chunks in memory (the state machine holds the whole snapshot in memory anyway) and replies with how many bytes it holds (`Next`). A chunk at a gap gets the offset it should have sent instead. A resend of bytes it already has is taken from that offset. A mid-transfer chunk of a different snapshot gets "start over" but doesn't discard the transfer in progress. The last chunk installs exactly as a whole snapshot did, after checking that the reassembled bytes are valid JSON.
+- The leader sends one chunk at a time, taking the next offset from the follower's reply. On an error it records where it got to (`snapshotSent`), and the transfer started by the next heartbeat resumes there for the same snapshot. A follower that lost its partial copy (it restarted) answers `Next = 0`, and the transfer starts over.
+- Compatibility: a snapshot of 1 MiB or less is still sent as the original whole-snapshot RPC, unchanged on the wire. Chunks use a new message type (`rpcSnapshotChunk`). A peer that predates it hangs up on the unknown type; the transport reports `ErrSnapshotChunksUnsupported`, and the leader sends that peer the snapshot whole for that transfer.
+
+Tests: `TestChunkedSnapshotTransfer` (contiguous chunks of at most 1 MiB, bytes intact), `TestChunkedSnapshotResumesAfterFailure` (fails if the leader restarts from 0), `TestChunkedSnapshotFallsBackToWholeForOldPeers`, `TestFollowerReassemblesChunks` (gaps, resends, stray chunks; fails if the follower ignores offsets), `TestTCPTransportChunksAgainstOldPeer`, `TestTCPTransportCarriesChunks`. The 40 MB `TestFollowerCatchesUpWithLargeSnapshot` and the `snapshot_catchup` e2e scenario (~3 MB, between real processes) now go through chunks, at the same speed as before.
+
 ### The KV state machine (internal/raftkv)
 
 `raftkv.KV` sits between the TCP server and Raft:
@@ -227,6 +235,8 @@ Single-server changes are safe because any majority of the old configuration ove
 - **CheckQuorum.** A leader that hasn't heard from a majority within the maximum election timeout steps down, without changing the term. Ignoring RequestVotes (the previous rule) depends on this. Otherwise a leader cut off from the majority, but still reaching a few followers, keeps those followers ignoring candidates, and no one can gather a majority. In a 4-node cluster where the leader reaches only one node, nothing committed until the partition healed. The chaos test exposed this under CPU contention, by sometimes committing nothing at all, and `TestLeaderWithoutQuorumStepsDown` reproduces it deterministically.
 - **Non-members never campaign.** That is also how a new node waits: `--join` starts it with an empty configuration, and it stays passive until a leader adds it and replicates the configuration to it.
 
+**New servers catch up before they vote** (thesis §4.2.1). Adding a server used to put it in the configuration at once. A newcomer is empty, so commits then needed a majority that included a node still copying the whole log; adding a server that never answered to a one-node cluster made the majority two, the leader stepped down (CheckQuorum), and the cluster stopped for good. Now `AddServer` first registers the server as a *learner*: the leader replicates to it like any follower (AppendEntries, or InstallSnapshot if it needs compacted entries), but it counts toward no majority and doesn't vote. Catch-up runs in rounds: each round waits for the learner to reach the leader's last index as of the round's start, and a round that finishes within an election timeout means what's left is small, so the leader proposes the config entry. If the learner hasn't caught up by the deadline (`--catch-up-timeout`, default 2 minutes), `AddServer` returns `ErrCatchUpTimeout` and membership is unchanged. Learner state lives only on the leader and isn't persisted: if leadership changes, `AddServer` fails with `NotLeaderError`, and the caller retries with the new leader. The catch-up counts as the change in progress, so a concurrent `AddServer` or `RemoveServer` gets `ErrConfigChangeInProgress`. Nothing changes on disk or on the wire. Tests: `TestAddUnreachableServerDoesNotStallCluster` (fails if learners are counted toward the majority, or if the catch-up is skipped), `TestAddServerWaitsUntilCaughtUp`, `TestAddServerFailsWhenLeaderChanges`; the `add_unreachable` e2e scenario shows the old binary's stall.
+
 `TestMembershipChaos` runs random adds, removes, partitions, crashes and restarts (with state on disk) under a stream of proposals. A monitor samples every node's role and term for two leaders in one term, and at the end every node's applied sequence is checked against the others. Writing it surfaced two lessons about the test itself. First, unpaced chaos (thousands of crashes a second) committed nothing, so the safety checks passed vacuously; it now asserts progress. Second, random chaos almost never produces an exact 2/2 split, so it missed an injected "a tie counts as a majority" bug. `TestEvenSplitHasNoQuorum` covers that case directly.
 
 It also found a real bug: after a membership change, the newest committed entry is a config entry, which (like a no-op) is never delivered on `applyCh`, so the read index pointed at an index the state machine could never reach. Every linearizable read hung until the next write. `LogEntry.delivered()` is now the single definition used by both `applyLoop` and ReadIndex.
@@ -235,7 +245,7 @@ It also found a real bug: after a membership change, the newest committed entry 
 
 RPCs between nodes use a hand-written binary codec (`codec.go`): uvarints, length-prefixed fields, and every length bounds-checked against the remaining input, so garbage can't cause a panic or a huge allocation (`FuzzDecodeRPC`). JSON had been ~25% of CPU on the write path. Binary requests use new type codes. A server still answers JSON requests in JSON, and a client that gets hung up on (which is what older versions do with an unknown type) retries in JSON and remembers that peer, so clusters can be upgraded one node at a time. That was verified with a cluster of two old nodes and one new node, with the new node leading.
 
-AppendEntries batches are capped at 4 MiB of commands. Without the cap, a follower more than 32 MiB behind (the old message limit) received an oversized message on every attempt, never caught up, and campaigned forever. Snapshots get a separate 2 GiB message limit, since they carry the whole state machine.
+AppendEntries batches are capped at 4 MiB of commands. Without the cap, a follower more than 32 MiB behind (the old message limit) received an oversized message on every attempt, never caught up, and campaigned forever. Snapshots over 1 MiB travel in 1 MiB chunks (see Snapshots), within the ordinary limit; a whole snapshot (from an older leader, or to an older peer) keeps the old 2 GiB limit.
 
 ### Linearizable reads: ReadIndex
 
@@ -287,10 +297,28 @@ Each SSTable also gets a Bloom filter over its keys (`bloom.go`), built during t
 The first design had two levels, and every L0 compaction merged *all* of L1 into one file. Write amplification therefore grew linearly with the data: 6× at 5 MB, 17× at 16 MB. The engine now uses the LevelDB scheme (`levels.go`):
 
 - **Levels:** L1–L6 hold files with disjoint key ranges, sorted by key, each about `TargetFileSize`; each level's budget is 10× the previous one. A lookup reads at most one file per level (binary search on file ranges, then the bloom filter).
-- **Compaction:** when L0 has 4 files, they merge with only the L1 files they overlap. When a level exceeds its budget, one of its files (chosen round-robin through the key space) merges with the files it overlaps one level down. Outputs are split at `TargetFileSize`.
+- **Compaction:** when L0 has 4 files, they merge with only the L1 files they overlap. When a level exceeds its budget, one of its files (chosen round-robin through the key space) merges with the files it overlaps one level down. Outputs are split at `TargetFileSize`. When several levels need it, the one furthest over budget goes first (L0 scored by file count over 4, deeper levels by bytes over budget, as in LevelDB).
 - **Tombstones:** a tombstone is dropped only when no deeper level has a file covering its key. Otherwise it must keep shadowing the older value below. The randomized model test catches dropping them unconditionally.
 
-Write amplification for scattered keys is now 5.9× / 10.2× / 13.7× at 200k / 600k / 1.8M keys, growing with the number of levels rather than the data size.
+Write amplification for scattered keys is 5.4× / 7.5× / 10.4× at 200k / 600k / 1.8M keys (it was 5.9× / 10.2× / 13.7× with compaction inline), growing with the number of levels rather than the data size.
+
+### Background compaction
+
+Compaction used to run inline: the write that filled L0 did the merge, holding the engine lock, so that write, every writer queued behind it and every reader waited for the whole merge (up to ~0.4 s in `BenchmarkLSMLatencyUnderCompaction`). It now runs on one background goroutine, in three steps, so neither readers nor writers wait on its I/O:
+
+1. **Plan** (read lock): choose the inputs, and copy the levels below the output level for the tombstone rule.
+2. **Merge** (no engine lock): read the inputs, write the outputs. SSTables are immutable and are only closed by a compaction's own manifest edit, so reading them unlocked is safe.
+3. **Install** (write lock): one manifest edit swaps outputs for inputs, exactly as before.
+
+A separate mutex (`cmu`) runs one compaction at a time. Only compactions change levels 1 and below (a flush only adds an L0 file), so the copy taken in step 1 is still accurate in step 3. A flush can add L0 files during the merge; that's fine, because they are newer than every input, stay above the output, and the edit removes inputs by identity rather than "all of L0". Crash safety is unchanged: outputs are durable before the edit, and anything not in the manifest is deleted on open.
+
+Flushes still run on the writer that fills the MemTable (bounded by `MemTableSize`), but the SSTable is now written without the engine lock: `wmu` already keeps the MemTable from changing, so readers carry on reading it during the write.
+
+Backpressure: if writes outpace compaction, L0 grows, and every read checks every L0 file. Once L0 reaches 12 files (LevelDB's stop trigger), a write that flushes waits until compaction brings it down. If compaction is failing (disk full, I/O error), it retries every second, `Stats()` reports the error, and a write that would stall returns it instead of hanging. `Close` abandons a merge in progress; its outputs aren't in the manifest, so they are simply deleted.
+
+Getting the scheduling right mattered. The first version always compacted L0 first when it had 4 files. With compaction concurrent with writes, L0 is nearly always at 4, so L1 was never compacted down; it grew far past its budget until every L0 merge rewrote all of it, and write amplification at 1.8M keys went from 13.7× to 34× (`TestPickCompactionScoresLevels` pins the fix). Another early failure was in the tests: the randomized model test "crashes" by abandoning an engine and reopening the directory, and the abandoned engine's compactor kept running against it. The test's `crash` now stops the goroutine, as a real crash would.
+
+`Compact()` (merge all of L0, then settle) and `WaitForCompactions()` (settle) run compactions in the caller, for tests and tools that want a settled tree. Tests: `TestWritesDontWaitForCompaction` (writes and reads proceed while a compaction is blocked), `TestWritesStallAtL0Limit`, `TestCompactionErrorReachesStalledWriters`, `TestReadsDuringBackgroundCompaction` (concurrent writers and readers; no read older than an acknowledged write).
 
 ### Durability and recovery
 
@@ -302,11 +330,11 @@ Writes go to the MemTable, an in-memory map that is sorted when it is flushed. W
 
 ### Read path
 
-Search order: MemTable first, then L0 SSTables newest-to-oldest, then L1. A tombstone in a newer layer shadows any value in an older layer. This is the key correctness property: MemTable.Delete must stop the search before it reaches L0, otherwise a deleted key would reappear.
+Search order: MemTable first, then L0 SSTables newest-to-oldest, then at most one file per deeper level. A tombstone in a newer layer shadows any value in an older layer. This is the key correctness property: MemTable.Delete must stop the search before it reaches L0, otherwise a deleted key would reappear.
 
 ### Compaction
 
-When L0 has too many SSTables (default 4), they are merged with L1 into a new L1 SSTable. Compaction:
+Merging (see "Leveled compaction" above for which files):
 - Applies entries oldest-to-newest so newer values override older ones correctly.
 - Drops tombstoned keys so deleted data does not accumulate forever.
 - Removes the old files from disk.

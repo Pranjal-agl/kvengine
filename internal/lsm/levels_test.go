@@ -15,6 +15,9 @@ func tiny() Options {
 
 func checkLevelInvariants(t *testing.T, e *Engine) {
 	t.Helper()
+	if err := e.WaitForCompactions(); err != nil {
+		t.Fatal(err)
+	}
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	for lvl := 1; lvl < numLevels; lvl++ {

@@ -2,6 +2,7 @@ package raft
 
 import (
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -206,5 +207,76 @@ func TestReadIndexSkipsConfigEntries(t *testing.T) {
 	l.mu.Unlock()
 	if !e.delivered() {
 		t.Fatalf("read index %d points at an undelivered entry (kind %d)", idx, e.Kind)
+	}
+}
+
+// hangingReadIndex delays ReadIndex RPCs while hang is set, like a leader
+// that is frozen (SIGSTOP, GC pause, overloaded) with its connections open.
+type hangingReadIndex struct {
+	*MemTransport
+	hang    atomic.Bool
+	release chan struct{}
+}
+
+func (h *hangingReadIndex) ReadIndex(peer string, args ReadIndexArgs) (ReadIndexReply, error) {
+	if h.hang.Load() {
+		<-h.release
+	}
+	return h.MemTransport.ReadIndex(peer, args)
+}
+
+// TestFollowerReadIndexHonoursTimeout: a follower's ReadIndex returns by
+// its deadline even when the RPC to the leader doesn't. It used to wait for
+// the transport's own timeout (10 s over TCP, with its retry).
+func TestFollowerReadIndexHonoursTimeout(t *testing.T) {
+	tr := &hangingReadIndex{MemTransport: NewMemTransport(), release: make(chan struct{})}
+	ids := []string{"a", "b", "c"}
+	nodes := make([]*Node, len(ids))
+	for i, id := range ids {
+		var peers []string
+		for _, p := range ids {
+			if p != id {
+				peers = append(peers, p)
+			}
+		}
+		n, err := NewNode(id, peers, tr, make(chan ApplyMsg, 256), "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		nodes[i] = n
+	}
+	t.Cleanup(func() {
+		close(tr.release)
+		for _, n := range nodes {
+			n.Stop()
+		}
+	})
+
+	var follower *Node
+	deadline := time.Now().Add(3 * time.Second)
+	for follower == nil && time.Now().Before(deadline) {
+		for _, n := range nodes {
+			if st := n.State(); st.Role != Leader && st.LeaderId != "" {
+				follower = n
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if follower == nil {
+		t.Fatal("no follower with a known leader")
+	}
+	if _, err := follower.ReadIndex(time.Second); err != nil {
+		t.Fatalf("ReadIndex before the hang: %v", err)
+	}
+
+	tr.hang.Store(true)
+	start := time.Now()
+	_, err := follower.ReadIndex(200 * time.Millisecond)
+	elapsed := time.Since(start)
+	if !errors.Is(err, ErrReadTimeout) {
+		t.Fatalf("err = %v, want ErrReadTimeout", err)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("ReadIndex(200ms) took %v", elapsed)
 	}
 }

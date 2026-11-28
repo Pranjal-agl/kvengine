@@ -131,6 +131,8 @@ go test -race -v -timeout 60s ./internal/raft/...
 - `TestTCPTransportReusesConnections`, `TestTCPTransportRetriesStaleConnection`, `TestTCPTransportCloseStopsExistingConnections`: connection pooling, transparent retry after a peer restart, and a closed transport going silent
 - `TestAddServer`, `TestRemoveFollower`, `TestRemoveLeader`, `TestOneMembershipChangeAtATime`: membership changes, including that a removed node can't disrupt the cluster and a removed leader steps down only once its removal commits
 - `TestUncommittedConfigRevertsOnTruncation`, `TestMembershipSurvivesSnapshotsAndRestart`, `TestRequestVoteIgnoredWhileLeaderAlive`, `TestEvenSplitHasNoQuorum`, `TestReadIndexSkipsConfigEntries`
+- `TestAddUnreachableServerDoesNotStallCluster`, `TestAddServerWaitsUntilCaughtUp`, `TestAddServerFailsWhenLeaderChanges`: AddServer catches a new server up as a non-voting learner first; one that never catches up is dropped with membership unchanged, and the cluster keeps committing meanwhile
+- `TestChunkedSnapshotTransfer`, `TestChunkedSnapshotResumesAfterFailure`, `TestChunkedSnapshotFallsBackToWholeForOldPeers`, `TestFollowerReassemblesChunks`, `TestTCPTransportChunksAgainstOldPeer`, `TestTCPTransportCarriesChunks`: chunked InstallSnapshot — contiguous 1 MiB chunks, resume after a failure, reassembly rules, and the whole-snapshot fallback for older peers
 - `TestLeaderWithoutQuorumStepsDown`: a leader that reaches only a minority steps down (CheckQuorum) so the majority can elect a new one
 - `TestMembershipChaos`: random membership changes, partitions, crashes and restarts under load; Election Safety checked continuously, State Machine Safety at the end
 - `TestCodecRoundTrip`, `TestCodecRejectsTruncationAndTrailingBytes`, `FuzzDecodeRPC`, `TestTCPTransportAnswersLegacyJSON`, `TestTCPTransportFallsBackToJSONForOldPeers`: the binary codec and rolling-upgrade compatibility
@@ -184,6 +186,30 @@ go test -race -v ./internal/linearcheck/...
 - `TestConcurrentStoreLinearizable`: 6 goroutines, 8 ops each, 3 keys; records every operation against a real Store and verifies the full history is linearizable
 - `TestCheckScalesToLargeHistories`: 3,000-op, heavily overlapping histories (linearizable by construction) check in well under a second
 - `TestCheckFindsViolationInLargeHistory`, `TestCheckFindsStaleRead`: a single bad read in a large history, or a read of an overwritten value, is still caught
+
+---
+
+## End-to-end: real processes
+
+```bash
+make e2e                                  # all scenarios (~25 s)
+bash scripts/e2e/run.sh failover membership   # some of them
+```
+
+`scripts/e2e/run.sh` builds `kvengine`, builds the v1.0 release from git history (commit `47f1503`; set `KVENGINE_OLD_REF=none` to skip), and runs `scripts/e2e/run.py`, which starts real nodes on free localhost ports and drives them over the client protocol. It needs Python 3.8+ and nothing else. CI runs it on every push. Failed scenarios keep their logs and data directories under `/tmp/kvengine-e2e-*`.
+
+| Scenario | What it checks |
+|---|---|
+| `failover` | SIGKILL the leader: a new one is elected (~0.5 s), no acknowledged write is lost, followers reject writes and name the leader, the old leader catches up when restarted |
+| `binary_values` | CRLF, NUL, high bytes, empty and 256 KB values survive Raft, snapshots and a full restart |
+| `snapshot_catchup` | A node down for 300 writes (snapshots every 10) catches up via InstallSnapshot; the ~3 MB snapshot goes over in 1 MiB chunks |
+| `clean_shutdown` | SIGINT and SIGTERM exit 0 promptly and log `shutdown complete`; data is intact afterwards |
+| `follower_reads` | Linearizable follower reads see each write acknowledged just before them; with the leader frozen (SIGSTOP) they fail within the read timeout, while `--stale-reads` still answers |
+| `membership` | `--join` + `ADDNODE`, kill the leader, `REMOVENODE` it, add another node, then restart every node with no `--peers` at all (membership comes from disk) |
+| `add_unreachable` | `ADDNODE` of a node that never answers fails after `--catch-up-timeout`; the one-node cluster keeps committing (it used to stall) |
+| `crash_under_load` | SIGKILL all three nodes during an 8-writer load; after restart every acknowledged write is present |
+| `single_node` | Single-node CLI and server mode across restarts |
+| `migrate` | A cluster written by v1.0 is stopped and restarted on the new binary with its data, including keys like `user` that are valid base64 |
 
 ---
 
