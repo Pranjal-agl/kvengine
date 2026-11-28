@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -20,6 +21,12 @@ const (
 	rpcAppendEntries   rpcType = 2
 	rpcInstallSnapshot rpcType = 3
 	rpcReadIndex       rpcType = 4
+
+	// rpcBinary marks a payload in the binary codec (codec.go). Requests
+	// are always sent binary; the server also still answers JSON requests
+	// (types without this bit) from older versions, replying in kind, so
+	// a cluster can be upgraded one node at a time.
+	rpcBinary rpcType = 0x80
 
 	dialTimeout = 3 * time.Second
 	rpcTimeout  = 5 * time.Second
@@ -86,6 +93,7 @@ type TCPTransport struct {
 
 	poolMu sync.Mutex
 	idle   map[string][]*clientConn // peer → idle outbound conns
+	legacy map[string]bool          // peers that only speak JSON (older versions)
 	active map[net.Conn]struct{}    // inbound conns, closed by Close
 
 	accepted atomic.Int64 // inbound connections accepted (for tests/metrics)
@@ -109,6 +117,7 @@ func NewTCPTransport(addrs map[string]string) *TCPTransport {
 	return &TCPTransport{
 		addrs:  addrs,
 		idle:   make(map[string][]*clientConn),
+		legacy: make(map[string]bool),
 		active: make(map[net.Conn]struct{}),
 	}
 }
@@ -235,7 +244,12 @@ func (t *TCPTransport) handleConn(conn net.Conn) {
 		if !ok {
 			return
 		}
-		data, err := json.Marshal(reply)
+		var data []byte
+		if env.Type&rpcBinary != 0 {
+			data, err = encodeRPC(reply)
+		} else {
+			data, err = json.Marshal(reply)
+		}
 		if err != nil {
 			return
 		}
@@ -255,28 +269,32 @@ func (t *TCPTransport) handleConn(conn net.Conn) {
 // for an unknown type or undecodable payload; the connection is then
 // closed, since the stream can no longer be trusted.
 func dispatch(node *Node, env rpcEnvelope) (reply any, ok bool) {
-	switch env.Type {
+	decode := func(v any) bool { return json.Unmarshal(env.Payload, v) == nil }
+	if env.Type&rpcBinary != 0 {
+		decode = func(v any) bool { return decodeRPC(env.Payload, v) == nil }
+	}
+	switch env.Type &^ rpcBinary {
 	case rpcRequestVote:
 		var args RequestVoteArgs
-		if err := json.Unmarshal(env.Payload, &args); err != nil {
+		if !decode(&args) {
 			return nil, false
 		}
 		return node.HandleRequestVote(args), true
 	case rpcAppendEntries:
 		var args AppendEntriesArgs
-		if err := json.Unmarshal(env.Payload, &args); err != nil {
+		if !decode(&args) {
 			return nil, false
 		}
 		return node.HandleAppendEntries(args), true
 	case rpcInstallSnapshot:
 		var args InstallSnapshotArgs
-		if err := json.Unmarshal(env.Payload, &args); err != nil {
+		if !decode(&args) {
 			return nil, false
 		}
 		return node.HandleInstallSnapshot(args), true
 	case rpcReadIndex:
 		var args ReadIndexArgs
-		if err := json.Unmarshal(env.Payload, &args); err != nil {
+		if !decode(&args) {
 			return nil, false
 		}
 		return node.HandleReadIndex(args), true
@@ -328,13 +346,61 @@ func (t *TCPTransport) putConn(peer string, c *clientConn) {
 
 // call performs one request/response RPC, reusing a pooled connection
 // when possible.
+//
+// Requests go out in the binary codec. A peer running an older version
+// closes the connection on a type it doesn't know, without replying; if a
+// fresh connection gets EOF straight back, the call is retried once in
+// JSON and the peer is remembered as JSON-only. That memory is dropped
+// whenever the peer can't be dialed (it may be restarting with a new
+// version), so it gets re-probed.
 func (t *TCPTransport) call(peer string, typ rpcType, args, reply any) error {
-	data, err := json.Marshal(args)
+	if t.isLegacy(peer) {
+		return t.callFormat(peer, typ, args, reply, false)
+	}
+	err := t.callFormat(peer, typ, args, reply, true)
+	if errors.Is(err, errPeerHungUp) {
+		if jerr := t.callFormat(peer, typ, args, reply, false); jerr == nil {
+			t.setLegacy(peer, true)
+			return nil
+		}
+	}
+	return err
+}
+
+// errPeerHungUp: a freshly dialed connection was closed without a reply.
+var errPeerHungUp = errors.New("tcp transport: peer closed connection without replying")
+
+func (t *TCPTransport) isLegacy(peer string) bool {
+	t.poolMu.Lock()
+	defer t.poolMu.Unlock()
+	return t.legacy[peer]
+}
+
+func (t *TCPTransport) setLegacy(peer string, v bool) {
+	t.poolMu.Lock()
+	defer t.poolMu.Unlock()
+	if v {
+		t.legacy[peer] = true
+	} else {
+		delete(t.legacy, peer)
+	}
+}
+
+func (t *TCPTransport) callFormat(peer string, typ rpcType, args, reply any, binaryFmt bool) error {
+	var data []byte
+	var err error
+	if binaryFmt {
+		typ |= rpcBinary
+		data, err = encodeRPC(args)
+	} else {
+		data, err = json.Marshal(args)
+	}
 	if err != nil {
 		return err
 	}
 	c, reused, err := t.getConn(peer)
 	if err != nil {
+		t.setLegacy(peer, false) // unreachable: re-probe its format later
 		return err
 	}
 	env, err := roundTrip(c, typ, data)
@@ -343,17 +409,24 @@ func (t *TCPTransport) call(peer string, typ rpcType, args, reply any) error {
 		// idempotent, so retrying on a fresh connection is safe.
 		c.Close()
 		if c, err = t.dial(peer); err != nil {
+			t.setLegacy(peer, false)
 			return err
 		}
 		env, err = roundTrip(c, typ, data)
 	}
 	if err != nil {
 		c.Close()
+		if errors.Is(err, io.EOF) {
+			return errPeerHungUp
+		}
 		return err
 	}
 	t.putConn(peer, c)
 	if env.Type != typ {
 		return fmt.Errorf("tcp transport: reply type %d for request type %d", env.Type, typ)
+	}
+	if binaryFmt {
+		return decodeRPC(env.Payload, reply)
 	}
 	return json.Unmarshal(env.Payload, reply)
 }
