@@ -40,12 +40,34 @@ type KVStore interface {
 	Len() int
 }
 
+// ErrGetter is implemented by stores whose reads can fail — e.g. the
+// Raft-backed store, where a linearizable read needs a quorum. When the
+// backing store implements it, GET uses GetErr and reports failures as
+// -ERR instead of falling back to a possibly stale local read.
+type ErrGetter interface {
+	GetErr(key []byte) ([]byte, bool, error)
+}
+
+// Admin is implemented by stores that support cluster membership changes
+// (the Raft-backed store). When present, the server accepts:
+//
+//	ADDNODE <id> <raftAddr>\r\n  ->  +OK\r\n
+//	REMOVENODE <id>\r\n          ->  +OK\r\n
+//	MEMBERS\r\n                   ->  $<len>\r\n<"id addr [leader]" lines>\r\n
+type Admin interface {
+	AddNode(id, addr string) error
+	RemoveNode(id string) error
+	MembersInfo() string
+}
+
 // Server serves the kvengine protocol over TCP, backed by a KVStore.
 type Server struct {
 	store KVStore
 
-	mu       sync.Mutex // guards listener: written by Serve, read by Close/Addr from other goroutines
+	mu       sync.Mutex // guards listener, conns, closed
 	listener net.Listener
+	conns    map[net.Conn]struct{}
+	closed   bool
 
 	// IdleTimeout overrides defaultIdleTimeout; exported so tests can use a
 	// short timeout instead of waiting 30s. Zero means "use the default."
@@ -80,6 +102,11 @@ func (srv *Server) ListenAndServe(addr string) error {
 // read back the actual address before connecting).
 func (srv *Server) Serve(ln net.Listener) error {
 	srv.mu.Lock()
+	if srv.closed {
+		srv.mu.Unlock()
+		ln.Close()
+		return net.ErrClosed
+	}
 	srv.listener = ln
 	srv.mu.Unlock()
 
@@ -88,8 +115,33 @@ func (srv *Server) Serve(ln net.Listener) error {
 		if err != nil {
 			return err
 		}
+		if !srv.track(conn) {
+			conn.Close()
+			return net.ErrClosed
+		}
 		go srv.handleConn(conn)
 	}
+}
+
+// track registers conn so Close can reach it. Returns false if the server
+// is already closed.
+func (srv *Server) track(conn net.Conn) bool {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if srv.closed {
+		return false
+	}
+	if srv.conns == nil {
+		srv.conns = make(map[net.Conn]struct{})
+	}
+	srv.conns[conn] = struct{}{}
+	return true
+}
+
+func (srv *Server) untrack(conn net.Conn) {
+	srv.mu.Lock()
+	delete(srv.conns, conn)
+	srv.mu.Unlock()
 }
 
 func (srv *Server) Addr() net.Addr {
@@ -102,10 +154,19 @@ func (srv *Server) Addr() net.Addr {
 	return ln.Addr()
 }
 
+// Close stops accepting connections and closes every open connection.
+// A command already being executed (e.g. a Put waiting on fsync) completes
+// against the store, but its reply may not reach the client.
 func (srv *Server) Close() error {
 	srv.mu.Lock()
+	srv.closed = true
 	ln := srv.listener
+	conns := srv.conns
+	srv.conns = nil
 	srv.mu.Unlock()
+	for c := range conns {
+		c.Close()
+	}
 	if ln != nil {
 		return ln.Close()
 	}
@@ -117,6 +178,7 @@ func (srv *Server) Close() error {
 // value-reading path below, both of which use loop/ReadFull patterns that
 // are correct regardless of how the OS/network fragments the bytes.
 func (srv *Server) handleConn(conn net.Conn) {
+	defer srv.untrack(conn)
 	defer conn.Close()
 	r := bufio.NewReader(conn)
 	w := bufio.NewWriter(conn)
@@ -147,6 +209,8 @@ func (srv *Server) handleConn(conn net.Conn) {
 			srv.handleGet(w, fields)
 		case "DEL":
 			srv.handleDel(w, fields)
+		case "ADDNODE", "REMOVENODE", "MEMBERS":
+			srv.handleAdmin(w, cmd, fields)
 		default:
 			writeErr(w, fmt.Errorf("unknown command %q", cmd))
 		}
@@ -188,20 +252,23 @@ func readLine(r *bufio.Reader, maxSize int) ([]byte, error) {
 }
 
 // handlePut implements: PUT <key> <valueLen>\r\n<valueLen bytes>\r\n
-// Returns fatal=true if a framing error occurred that desyncs the byte
-// stream (e.g. a bad length means we don't know how many bytes to skip to
-// resync) — in that case the connection must be closed rather than
+// Returns fatal=true if the request is malformed: the byte stream can no
+// longer be framed reliably, so the connection must be closed rather than
 // continuing, since further reads would be misinterpreted.
 func (srv *Server) handlePut(conn net.Conn, r *bufio.Reader, w *bufio.Writer, fields []string) (fatal bool) {
+	// Any malformed PUT is fatal for the connection. The client has very
+	// likely sent value bytes after the line, and without a valid length
+	// there is no way to skip them: carrying on would execute them as
+	// commands (a value of "DEL k" would delete k).
 	if len(fields) != 3 {
 		writeErr(w, fmt.Errorf("PUT requires <key> <valueLen>, got %d args", len(fields)-1))
-		return false // safe to continue: no value bytes were promised on the wire
+		return true
 	}
 	key := fields[1]
 	n, err := strconv.Atoi(fields[2])
 	if err != nil || n < 0 {
 		writeErr(w, fmt.Errorf("invalid value length %q", fields[2]))
-		return false
+		return true
 	}
 	if n > maxValueSize {
 		writeErr(w, fmt.Errorf("value length %d exceeds max %d", n, maxValueSize))
@@ -244,7 +311,17 @@ func (srv *Server) handleGet(w *bufio.Writer, fields []string) {
 		writeErr(w, fmt.Errorf("GET requires exactly 1 arg, got %d", len(fields)-1))
 		return
 	}
-	v, ok := srv.store.Get([]byte(fields[1]))
+	var v []byte
+	var ok bool
+	if eg, isEG := srv.store.(ErrGetter); isEG {
+		var err error
+		if v, ok, err = eg.GetErr([]byte(fields[1])); err != nil {
+			writeErr(w, fmt.Errorf("get failed: %w", err))
+			return
+		}
+	} else {
+		v, ok = srv.store.Get([]byte(fields[1]))
+	}
 	if !ok {
 		fmt.Fprint(w, "$-1\r\n")
 		return
@@ -262,6 +339,33 @@ func (srv *Server) handleDel(w *bufio.Writer, fields []string) {
 	}
 	if err := srv.store.Delete([]byte(fields[1])); err != nil {
 		writeErr(w, fmt.Errorf("delete failed: %w", err))
+		return
+	}
+	fmt.Fprint(w, "+OK\r\n")
+}
+
+func (srv *Server) handleAdmin(w *bufio.Writer, cmd string, fields []string) {
+	admin, ok := srv.store.(Admin)
+	if !ok {
+		writeErr(w, fmt.Errorf("%s not supported: this server is not running in Raft mode", cmd))
+		return
+	}
+	var err error
+	switch {
+	case cmd == "ADDNODE" && len(fields) == 3:
+		err = admin.AddNode(fields[1], fields[2])
+	case cmd == "REMOVENODE" && len(fields) == 2:
+		err = admin.RemoveNode(fields[1])
+	case cmd == "MEMBERS" && len(fields) == 1:
+		info := admin.MembersInfo()
+		fmt.Fprintf(w, "$%d\r\n%s\r\n", len(info), info)
+		return
+	default:
+		writeErr(w, fmt.Errorf("usage: ADDNODE <id> <raftAddr> | REMOVENODE <id> | MEMBERS"))
+		return
+	}
+	if err != nil {
+		writeErr(w, fmt.Errorf("%s failed: %w", strings.ToLower(cmd), err))
 		return
 	}
 	fmt.Fprint(w, "+OK\r\n")

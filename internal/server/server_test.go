@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"net"
 	"path/filepath"
 	"sync"
@@ -295,5 +296,191 @@ func TestSlowClientDoesNotBlockOthers(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatalf("fast client was blocked by the slow client — connection isolation is broken")
+	}
+}
+
+// TestCloseDisconnectsClients: Close must drop open connections, not just
+// stop accepting new ones, so a shutdown doesn't hang on idle clients.
+func TestCloseDisconnectsClients(t *testing.T) {
+	srv, addr := startTestServer(t)
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	fmt.Fprint(conn, "GET k\r\n")
+	r := bufio.NewReader(conn)
+	if line, _ := r.ReadString('\n'); line != "$-1\r\n" {
+		t.Fatalf("got %q", line)
+	}
+
+	srv.Close()
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := r.ReadByte(); err == nil {
+		t.Fatal("connection still open after Close")
+	} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		t.Fatal("connection still open after Close (read timed out)")
+	}
+}
+
+// errStore is a KVStore whose reads go through GetErr and can fail.
+type errStore struct {
+	KVStore
+	err error
+}
+
+func (e errStore) GetErr(key []byte) ([]byte, bool, error) {
+	if e.err != nil {
+		return nil, false, e.err
+	}
+	v, ok := e.KVStore.Get(key)
+	return v, ok, nil
+}
+
+// TestGetUsesGetErr: when the store implements ErrGetter, a failed read is
+// reported as -ERR, never as a (possibly stale) local value or $-1.
+func TestGetUsesGetErr(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "s.wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	s.Put([]byte("k"), []byte("v"))
+
+	for _, tc := range []struct {
+		err  error
+		want string
+	}{
+		{nil, "$1\r\n"},
+		{fmt.Errorf("no quorum"), "-ERR get failed: no quorum\r\n"},
+	} {
+		srv := New(errStore{KVStore: s, err: tc.err})
+		ln, _ := net.Listen("tcp", "127.0.0.1:0")
+		go srv.Serve(ln)
+		conn, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		fmt.Fprint(conn, "GET k\r\n")
+		line, _ := bufio.NewReader(conn).ReadString('\n')
+		conn.Close()
+		srv.Close()
+		if line != tc.want {
+			t.Errorf("err=%v: got %q, want %q", tc.err, line, tc.want)
+		}
+	}
+}
+
+type fakeAdmin struct {
+	KVStore
+	added, removed []string
+}
+
+func (f *fakeAdmin) AddNode(id, addr string) error {
+	f.added = append(f.added, id+"@"+addr)
+	return nil
+}
+func (f *fakeAdmin) RemoveNode(id string) error {
+	if id == "bad" {
+		return fmt.Errorf("no such member")
+	}
+	f.removed = append(f.removed, id)
+	return nil
+}
+func (f *fakeAdmin) MembersInfo() string { return "n0 a:1 leader\nn1 a:2\n" }
+
+func TestAdminCommands(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "s.wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	fa := &fakeAdmin{KVStore: s}
+	srv := New(fa)
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	go srv.Serve(ln)
+	defer srv.Close()
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	r := bufio.NewReader(conn)
+	send := func(cmd string) string {
+		fmt.Fprint(conn, cmd)
+		line, _ := r.ReadString('\n')
+		return line
+	}
+	if got := send("ADDNODE n2 10.0.0.3:7000\r\n"); got != "+OK\r\n" {
+		t.Fatalf("ADDNODE: %q", got)
+	}
+	if got := send("REMOVENODE bad\r\n"); got != "-ERR removenode failed: no such member\r\n" {
+		t.Fatalf("REMOVENODE bad: %q", got)
+	}
+	if got := send("ADDNODE onlyid\r\n"); got[:4] != "-ERR" {
+		t.Fatalf("bad ADDNODE args: %q", got)
+	}
+	if got := send("MEMBERS\r\n"); got != "$21\r\n" {
+		t.Fatalf("MEMBERS header: %q", got)
+	}
+	body := make([]byte, 23)
+	io.ReadFull(r, body)
+	if string(body) != "n0 a:1 leader\nn1 a:2\n\r\n" {
+		t.Fatalf("MEMBERS body: %q", body)
+	}
+	if len(fa.added) != 1 || fa.added[0] != "n2@10.0.0.3:7000" {
+		t.Fatalf("added = %v", fa.added)
+	}
+}
+
+// Without Raft, admin commands are refused cleanly.
+func TestAdminCommandsWithoutRaft(t *testing.T) {
+	_, addr := startTestServer(t)
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	fmt.Fprint(conn, "MEMBERS\r\n")
+	line, _ := bufio.NewReader(conn).ReadString('\n')
+	if line[:4] != "-ERR" {
+		t.Fatalf("got %q", line)
+	}
+}
+
+// A PUT with a malformed length leaves the server unable to tell where the
+// value ends, so it must not keep parsing: the client has almost certainly
+// sent the value anyway, and reading it as commands would let a value of
+// "DEL victim" delete a key.
+func TestMalformedPutCannotInjectCommands(t *testing.T) {
+	for _, bad := range []string{"PUT k abc\r\n", "PUT k -5\r\n", "PUT k\r\n", "PUT k 5 extra\r\n"} {
+		srv, addr := startTestServer(t)
+		_ = srv
+		set, _ := net.Dial("tcp", addr)
+		fmt.Fprint(set, "PUT victim 1\r\nx\r\n")
+		bufio.NewReader(set).ReadString('\n')
+		set.Close()
+
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fmt.Fprint(conn, bad+"DEL victim\r\n\r\n")
+		r := bufio.NewReader(conn)
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		first, _ := r.ReadString('\n')
+		rest, _ := r.ReadString('\n')
+		conn.Close()
+		if first[:4] != "-ERR" || rest != "" {
+			t.Fatalf("%q: got %q then %q; want -ERR and the connection closed", bad, first, rest)
+		}
+
+		check, _ := net.Dial("tcp", addr)
+		fmt.Fprint(check, "GET victim\r\n")
+		line, _ := bufio.NewReader(check).ReadString('\n')
+		check.Close()
+		if line != "$1\r\n" {
+			t.Fatalf("%q: value bytes were executed as a command (GET victim -> %q)", bad, line)
+		}
 	}
 }

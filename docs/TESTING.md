@@ -27,6 +27,7 @@ Expected output, every package should say ok:
 ok  kvengine/internal/linearcheck
 ok  kvengine/internal/lsm
 ok  kvengine/internal/raft
+ok  kvengine/internal/raftkv
 ok  kvengine/internal/replication
 ok  kvengine/internal/server
 ok  kvengine/internal/store
@@ -37,7 +38,7 @@ ok  kvengine/test/fault_injection
 Run it a few times to catch any timing-sensitive flakiness in the Raft tests:
 
 ```bash
-go test -race -count=3 -timeout 3m ./internal/raft/...
+go test -race -count=3 -timeout 3m ./internal/raft/... ./internal/raftkv/...
 ```
 
 ---
@@ -52,6 +53,7 @@ go test -race -v ./internal/wal/...
 
 - `TestAppendReplayRoundTrip`: write records, close, reopen, verify they are all there
 - `TestReplayTornTail`: manually truncate a record mid-write to simulate a crash; replay must recover the clean prefix and silently drop the torn one
+- `TestOpenTruncatesTornTail`: Open must cut the torn tail off the file (saving it to `.corrupt-<offset>`) so records appended afterwards are replayable
 - `FuzzReadRecord`: seed corpus includes a max-length field (0xFFFFFFFF) that previously caused a 4 GB allocation; the sanity cap in ReadRecord catches it
 
 ### internal/store
@@ -62,7 +64,11 @@ go test -race -v ./internal/store/...
 
 - `TestRestartRecoversState`: write data, close, reopen, verify state survived via WAL replay
 - `TestConcurrentStress`: 50 goroutines hammering 20 keys; must pass `go test -race` cleanly
-- `TestLinearizability`: 30 goroutines on 8 keys, records completion order, replays against a reference model; proves the values are correct not just that it did not crash
+- `TestLinearizability`: 30 goroutines on 8 keys; each key's final value must come from a write not strictly followed (in real time) by another write to that key
+- `TestConcurrentSameKeyMemoryMatchesLog`: memory state before a restart must equal WAL replay after it, under concurrent writes to the same keys
+- `TestWritesAfterTornTailSurviveSecondRestart`: crash with a torn tail, restart, write, restart again; every acknowledged write must survive
+- `TestRestoreSnapshotReplacesState`, `TestSnapshotBinarySafe`: snapshots replace (not merge) state and round-trip binary keys/values
+- `TestCompactShrinksWALAndKeepsData`, `TestAutoCompaction`, `TestCompactionOffWhileReplicating`, `TestInterruptedCompactionLeftover`, `TestConcurrentWritesDuringCompaction`: WAL compaction
 
 ### test/fault_injection
 
@@ -71,6 +77,10 @@ go test -v ./test/fault_injection/...
 ```
 
 This one takes about 30 seconds. It spawns a real subprocess, writes records in a loop with fsync after each, kills it with SIGKILL at a random point, and verifies no confirmed write was lost. Runs 15 times with different kill timing.
+
+`TestStoreCompactionFaultInjection` does the same against the WAL store while it compacts its log every few dozen writes, so kills land mid-rewrite and around the rename.
+
+`TestLSMFaultInjection` does the same against the LSM engine, with a 2 KB MemTable so the writer is constantly flushing and compacting when the kill lands. The recovered state must match the model after exactly the acknowledged operations (or one more, if the in-flight operation reached the WAL).
 
 Skip during fast iteration:
 
@@ -108,6 +118,41 @@ go test -race -v -timeout 60s ./internal/raft/...
 - `TestTCPTransportCluster`: 3 nodes over real TCP loopback sockets, not in-memory; elect a leader and replicate 5 commands
 - `TestSimPacketLoss`: 20% packet drop rate; Raft must still elect a leader and commit entries
 - `TestSimHighDropRatePartition`: 90% drop rate to one follower; cluster still makes progress with the other follower
+- `TestVoteNotResetBySameTermHeartbeat`: a node that voted in term T must not vote again in T after a heartbeat (Election Safety)
+- `TestReplicationContinuesAfterSnapshot`: every node snapshots every 5 entries; replication and apply keep working long after the first compaction
+- `TestLaggingFollowerCatchesUpViaInstallSnapshot`: a partitioned follower falls behind the leader's snapshot and catches up via InstallSnapshot
+- `TestRestartWithSnapshotKeepsIndices`: a node restarted from snapshot + persisted log tail rejoins with correct absolute indices
+- `TestReadIndexFailsOnIsolatedLeader`: a leader that can't reach a quorum never hands out a read index
+- `TestReadIndexOnLeaderAndFollower`, `TestReadIndexSkipsNoOps`, `TestReadIndexWaitsForCurrentTermCommit`: the returned index covers every committed write, points at a real command, and is only issued once the leader has committed in its own term
+- `TestConcurrentReadsShareRounds`: 20 reads queued behind a stalled confirmation round complete in 2 rounds, not 20
+- `TestTruncationSurvivesRestart`, `TestNilVersusEmptyCommandOnDisk`, `TestTornLogTailRecovered`: the append-only log file replays truncations, no-ops and torn tails correctly
+- `TestSnapshotNewerThanLogFile`: crash between writing a snapshot and rewriting the log, in both the agreeing and conflicting cases
+- `TestLegacyStateFileMigrates`, `TestSnapshotCompactsLogFile`, `TestSingleNodeOnDiskCommitsAfterFsync`: format migration, log compaction on disk, and commit via the batched leader fsync
+- `TestTCPTransportReusesConnections`, `TestTCPTransportRetriesStaleConnection`, `TestTCPTransportCloseStopsExistingConnections`: connection pooling, transparent retry after a peer restart, and a closed transport going silent
+- `TestAddServer`, `TestRemoveFollower`, `TestRemoveLeader`, `TestOneMembershipChangeAtATime`: membership changes, including that a removed node can't disrupt the cluster and a removed leader steps down only once its removal commits
+- `TestUncommittedConfigRevertsOnTruncation`, `TestMembershipSurvivesSnapshotsAndRestart`, `TestRequestVoteIgnoredWhileLeaderAlive`, `TestEvenSplitHasNoQuorum`, `TestReadIndexSkipsConfigEntries`
+- `TestLeaderWithoutQuorumStepsDown`: a leader that reaches only a minority steps down (CheckQuorum) so the majority can elect a new one
+- `TestMembershipChaos`: random membership changes, partitions, crashes and restarts under load; Election Safety checked continuously, State Machine Safety at the end
+- `TestCodecRoundTrip`, `TestCodecRejectsTruncationAndTrailingBytes`, `FuzzDecodeRPC`, `TestTCPTransportAnswersLegacyJSON`, `TestTCPTransportFallsBackToJSONForOldPeers`: the binary codec and rolling-upgrade compatibility
+
+### internal/raftkv
+
+```bash
+go test -race -v ./internal/raftkv/...
+```
+
+- `TestPutIsAppliedBeforeReturning`: an acknowledged Put is immediately visible on the leader and eventually on every follower
+- `TestIsolatedLeaderDoesNotAcknowledge`: a leader cut off from its quorum must not return success, and its unacknowledged write never appears on the majority side
+- `TestFollowerRejectsWrites`: writes to a follower fail with the leader's ID
+- `TestBinarySafeThroughRaftAndSnapshots`: non-UTF-8 keys and values survive the Raft log, snapshots, and a restart
+- `TestFullClusterRestartRecoversState`: stop all nodes, start them again; all state comes back without any new write
+- `TestLaggingFollowerCatchesUpWithSnapshot`: end-to-end InstallSnapshot through the KV layer
+- `TestLinearizableHistory`: 10 clients, 300 ops per round, writes through the leader and reads from every node; the recorded history must pass the linearizability checker
+- `TestFollowerReadsSeeAcknowledgedWrites`: a follower read issued right after a write is acknowledged returns that write
+- `TestDeposedLeaderCannotServeStaleRead`: a partitioned ex-leader (whose local state is stale) refuses linearizable reads
+- `TestFollowerReadWithNoQuorum`: with no quorum, follower reads fail promptly instead of hanging or going stale
+- `TestAddAndRemoveNode`: a joining node catches up on earlier data; removing the leader hands off cleanly
+- `TestFollowerCatchesUpAfterLargeBacklog`, `TestFollowerCatchesUpWithLargeSnapshot`: a follower 40 MB behind catches up through capped AppendEntries batches or a >32 MiB snapshot (skipped under -race, which slows big copies ~10x)
 
 ### internal/lsm
 
@@ -116,6 +161,16 @@ go test -race -v ./internal/lsm/...
 ```
 
 - `TestTombstoneAcrossLevels`: Delete in MemTable must shadow the value in L0, not fall through to it
+- `TestTombstoneInSSTableShadowsOlderSSTable`, `TestTombstoneInL0ShadowsL1`: a delete already flushed to disk must still hide older values
+- `TestReopenRecoversSSTables`: flushed and compacted data (and tombstones) survive Close + Open
+- `TestReopenAfterInterruptedCompaction`: leftover inputs from a crashed compaction are discarded, not resurrected
+- `TestSparseIndexLookups`: every key and every gap between keys in a 500-entry table
+- `TestUnflushedWritesSurviveCrash`, `TestReplayOrderAfterInterruptedFlush`, `TestTornWALTailIgnored`: the memtable WAL recovers unflushed writes, replays leftover WALs oldest first, and ignores a torn tail
+- `TestWALFilesDoNotAccumulate`, `TestNoSyncSurvivesProcessCrash`, `TestConcurrentReadWriteWithFlushes`
+- `TestConcurrentSameKeyMemoryMatchesRecovery`: under group commit, 16 writers on 3 hot keys; memory before a crash must equal WAL replay after it
+- `TestBloomNoFalseNegativesAndLowFPRate`, `TestBloomSkipsTablesOnMiss`: no false negatives, ~0.8% false positives, misses skip tables, tombstones still found
+- `TestLeveledCompactionInvariants`, `TestTombstoneKeptUntilNothingOlderBelow`, `TestLSMMatchesModel`: levels stay sorted, disjoint and within budget; tombstones aren't dropped while older data remains below; random ops with crashes and reopens agree with a map
+- `TestOrphanSSTableIgnored`, `TestTornManifestTail`, `TestPreManifestDirectoryMigrates`: manifest recovery
 - `TestCompaction`: merges L0 into L1 correctly; updated keys show the new value, deleted keys are gone
 - `TestSSTableFileCountBounded`: after 20 rounds of writes and flushes, total SSTable file count stays bounded
 
@@ -127,6 +182,8 @@ go test -race -v ./internal/linearcheck/...
 
 - `TestCheckNotLinearizable`: two Gets returning different values with no Put between them is correctly identified as impossible
 - `TestConcurrentStoreLinearizable`: 6 goroutines, 8 ops each, 3 keys; records every operation against a real Store and verifies the full history is linearizable
+- `TestCheckScalesToLargeHistories`: 3,000-op, heavily overlapping histories (linearizable by construction) check in well under a second
+- `TestCheckFindsViolationInLargeHistory`, `TestCheckFindsStaleRead`: a single bad read in a large history, or a read of an overwritten value, is still caught
 
 ---
 
@@ -195,11 +252,14 @@ printf 'PUT mykey 5\r\nhello\r\n' | nc -q1 127.0.0.1 6380
 printf 'PUT mykey 5\r\nhello\r\n' | nc -q1 127.0.0.1 6381
 printf 'PUT mykey 5\r\nhello\r\n' | nc -q1 127.0.0.1 6382
 
-# Read from any node (reads are local)
+# Read from any node. Reads are linearizable: a follower asks the leader
+# for a read index and catches up before answering.
 printf 'GET mykey\r\n' | nc -q1 127.0.0.1 6381
 ```
 
 **Failover test:**
+
+Writes to a follower are rejected with `-ERR not leader (leader is n1)`.
 
 Kill the leader (Ctrl-C in its terminal). The other two elect a new leader in about 400ms. Try writing to them:
 
@@ -208,7 +268,7 @@ printf 'PUT afterfail 2\r\nok\r\n' | nc -q1 127.0.0.1 6381
 printf 'PUT afterfail 2\r\nok\r\n' | nc -q1 127.0.0.1 6382
 ```
 
-One of them will accept it. Restart the killed node and it will catch up automatically from the new leader.
+One of them will accept it. Restart the killed node and it will catch up automatically from the new leader. To exercise InstallSnapshot, start the nodes with `--snapshot-every 10` and write more than 10 keys while one node is down.
 
 ```bash
 rm -rf /tmp/kv kvengine
@@ -247,7 +307,7 @@ go test -bench=. -benchtime=3s ./internal/server/...
 go test -bench=. -benchtime=3s ./internal/lsm/...
 ```
 
-Compare `BenchmarkPutSequential` vs `BenchmarkPutParallel` vs `BenchmarkPutSameKeyParallel`. They should all be within noise of each other around 550 us. This confirms fsync is the bottleneck, not the lock.
+`BenchmarkPutSequential`, `BenchmarkPutParallel` and `BenchmarkPutSameKeyParallel` should be within noise of each other: with few writers, fsync is the bottleneck, not the lock. `BenchmarkPutConcurrentWriters` shows group commit: per-write cost should fall sharply as the writer count rises.
 
 ---
 

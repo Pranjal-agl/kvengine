@@ -4,13 +4,20 @@
 // the algorithm's correctness depends on a small set of invariants that are
 // easy to accidentally break.
 //
-// Known limitations (documented, not bugs):
-//   - Persistent state (currentTerm, votedFor, log) is in-memory only.
-//     A real deployment needs to persist these to disk before responding to
-//     any RPC — without this, a restarted node can vote twice in the same term,
-//     violating Election Safety. Marked as a TODO in docs/ROADMAP.md.
-//   - No log compaction / snapshots: the log grows forever.
-//   - No cluster membership changes.
+// Implemented: leader election, log replication with fast backup,
+// persistence of currentTerm/votedFor/log (persist.go), log compaction via
+// snapshots (snapshot.go), InstallSnapshot for followers that fall behind
+// the compaction point, and ReadIndex for linearizable reads (readindex.go).
+//
+// Indexing: Raft indices are absolute and never reset. After compaction,
+// n.log holds only the suffix starting at snapshotIndex — n.log[0] is a
+// sentinel standing in for the last compacted entry (its Term is
+// snapshotTerm). All access goes through the helpers in this file
+// (lastIndex, termAt, entryAt, sliceFrom) which translate absolute indices to
+// slice positions. Never index n.log directly with a Raft index.
+//
+// Known limitations: no cluster membership changes, no leader leases, no
+// pre-vote.
 package raft
 
 import (
@@ -18,9 +25,14 @@ import (
 	"math/rand"
 	"sync"
 	"time"
+
+	"kvengine/internal/wal"
 )
 
 const (
+	// maxAppendBytes bounds the command bytes in one AppendEntries.
+	maxAppendBytes = 4 << 20
+
 	heartbeatInterval  = 50 * time.Millisecond
 	electionTimeoutMin = 200 * time.Millisecond
 	electionTimeoutMax = 400 * time.Millisecond
@@ -50,16 +62,33 @@ func (r Role) String() string {
 // the client command (arbitrary bytes). log[0] is always a dummy sentinel
 // with Term=0 and Command=nil so that real entries start at index 1 and
 // "PrevLogIndex=0" always has a valid corresponding term.
+// delivered reports whether the entry is sent to the state machine on
+// applyCh. Leader no-ops (nil Command) and membership entries are not.
+// ReadIndex relies on this being the single definition.
+func (e LogEntry) delivered() bool { return e.Kind == EntryCommand && e.Command != nil }
+
 type LogEntry struct {
 	Term    uint64
 	Command []byte
+	Kind    EntryKind `json:",omitempty"` // EntryCommand or EntryConfig
 }
 
 // ApplyMsg is sent to applyCh when a log entry is committed by a quorum
 // and ready to be applied to the state machine (the Store).
+//
+// An ApplyMsg carries either a committed command or, when SnapshotValid is
+// set, a snapshot received from the leader via InstallSnapshot. On a
+// snapshot message the state machine must replace its entire state with
+// Snapshot; the next command will have index SnapshotIndex+1.
 type ApplyMsg struct {
 	CommandIndex uint64 // 1-indexed Raft log position
+	CommandTerm  uint64 // term of the entry; lets callers detect overwritten proposals
 	Command      []byte
+
+	SnapshotValid bool
+	Snapshot      []byte
+	SnapshotIndex uint64
+	SnapshotTerm  uint64
 }
 
 // --- RPC wire types ---
@@ -82,6 +111,29 @@ type AppendEntriesArgs struct {
 	Entries      []LogEntry
 	LeaderCommit uint64
 }
+
+// ReadIndexArgs asks the leader for a read index on behalf of a follower
+// serving a linearizable read (Raft thesis §6.4).
+type ReadIndexArgs struct {
+	From string
+}
+type ReadIndexReply struct {
+	Index    uint64 // commit index the follower must apply before reading
+	OK       bool   // false: the receiver could not confirm it is the leader
+	LeaderId string // receiver's view of the leader, as a redirect hint when !OK
+}
+
+type InstallSnapshotArgs struct {
+	Term              uint64
+	LeaderId          string
+	LastIncludedIndex uint64
+	LastIncludedTerm  uint64
+	Data              []byte
+	Config            Membership // membership as of LastIncludedIndex
+}
+type InstallSnapshotReply struct {
+	Term uint64
+}
 type AppendEntriesReply struct {
 	Term    uint64
 	Success bool
@@ -93,28 +145,43 @@ type AppendEntriesReply struct {
 }
 
 // Node is one member of a Raft cluster. All mutable state is guarded by mu.
-// External goroutines (transport, tests) call HandleRequestVote and
-// HandleAppendEntries under their own goroutines, each acquiring mu.
-// Timer goroutines (electionLoop, heartbeatLoop) also acquire mu when
-// they fire. The invariant: mu is NEVER held across a transport RPC call —
-// those are spawned as separate goroutines.
+// External goroutines (transport, tests) call the Handle* methods under
+// their own goroutines, each acquiring mu. Timer goroutines (electionLoop,
+// heartbeatLoop) also acquire mu when they fire. The invariant: mu is NEVER
+// held across a transport RPC call — those are spawned as separate
+// goroutines.
 type Node struct {
 	mu    sync.Mutex
 	id    string
-	peers []string
+	peers []string // current members other than this node (derived from config)
+
+	// Membership (membership.go). config is the latest configuration in
+	// the log (committed or not); configIndex is the index of the entry
+	// that set it (or snapshotIndex if it is the base). baseConfig is the
+	// configuration in effect at snapshotIndex.
+	config      Membership
+	configIndex uint64
+	baseConfig  Membership
+
+	// lastLeaderContact is when we last heard from a valid leader; used to
+	// ignore disruptive RequestVotes (§4.2.3).
+	lastLeaderContact time.Time
 
 	// statePath: file for durable Raft state. "" = no persistence (tests).
 	statePath    string
-	snapshotPath string // path to snapshot file; "" = no snapshots
+	snapshotPath string // path to snapshot file; "" = keep snapshots in memory only
 
-	// Snapshot state: the index/term of the last compacted log entry.
+	// Snapshot state: the index/term of the last compacted log entry, and
+	// the state machine bytes at that point (kept in memory so the leader
+	// can send InstallSnapshot without re-reading the file).
 	snapshotIndex uint64
 	snapshotTerm  uint64
+	snapshotData  []byte
 
 	// Persistent state — must be written to disk before any RPC reply.
 	currentTerm uint64
 	votedFor    string
-	log         []LogEntry
+	log         []LogEntry // log[0] is a sentinel for snapshotIndex
 
 	// Volatile state
 	commitIndex   uint64
@@ -122,10 +189,37 @@ type Node struct {
 	role          Role
 	leaderId      string
 	lastHeartbeat time.Time
+	pendingSnap   *ApplyMsg // installed snapshot not yet delivered to applyCh
 
 	// Leader-only volatile state
-	nextIndex  map[string]uint64
-	matchIndex map[string]uint64
+	nextIndex        map[string]uint64
+	matchIndex       map[string]uint64
+	snapshotInFlight map[string]bool
+
+	// ReadIndex support. Every AppendEntries/InstallSnapshot carries the
+	// value of hbRound when it was built; ackRound[peer] is the highest
+	// such round the peer has answered as a follower of our term. A read
+	// that bumps hbRound to r and then sees a majority with ackRound >= r
+	// knows we were still leader after the read arrived.
+	hbRound  uint64
+	ackRound map[string]uint64
+
+	// CheckQuorum: when each member last answered us as leader, and when we
+	// became leader. See checkQuorum.
+	lastAck     map[string]time.Time
+	leaderSince time.Time
+
+	// Read batching: at most one read-confirmation round is in flight.
+	// Reads arriving meanwhile are assigned the next round, which starts
+	// as soon as the in-flight one reaches a quorum, so N concurrent reads
+	// cost about one round trip, not N broadcasts.
+	readRound   uint64 // round currently in flight for reads (0 = none)
+	readRoundOn bool
+	readsQueued bool // some read is waiting for round readRound+1
+
+	// changed is closed (and replaced) whenever role, commitIndex or
+	// ackRound changes, waking goroutines blocked in ReadIndex.
+	changed chan struct{}
 
 	// Infrastructure
 	transport    Transport
@@ -133,68 +227,154 @@ type Node struct {
 	commitNotify chan struct{}
 	stopOnce     sync.Once // ensures Stop() is idempotent
 	stopCh       chan struct{}
+
+	logw *wal.WAL // append-only log file (nil when statePath is "")
+
+	// durableIndex is the last log index known to be fsynced. Followers
+	// persist before replying, so for them it tracks lastIndex. A leader
+	// appends proposals to memory, replicates them immediately, and lets
+	// persistLoop fsync whatever has accumulated in one batch (Raft thesis
+	// §10.2.1); it counts itself toward a majority only up to durableIndex.
+	durableIndex  uint64
+	persistNotify chan struct{}
 }
 
 // NewNode creates a Raft node. statePath and snapshotPath may be "" to
 // disable persistence (in-memory tests only). For real deployments, pass
 // paths like "/var/lib/kvengine/raft-state.json" and
 // "/var/lib/kvengine/raft-snapshot.json".
+//
+// If a snapshot exists, the caller must restore its state machine from
+// LatestSnapshot() before consuming applyCh: the first command delivered
+// after a restart is at index snapshotIndex+1.
 func NewNode(id string, peers []string, transport Transport, applyCh chan ApplyMsg, statePath string, snapshotPath ...string) (*Node, error) {
+	members := Membership{id: ""}
+	for _, p := range peers {
+		members[p] = ""
+	}
+	return NewNodeWithMembers(id, members, transport, applyCh, statePath, snapshotPath...)
+}
+
+// NewNodeWithMembers creates a node whose bootstrap configuration is
+// members (ID → transport address, which must include id itself to form a
+// new cluster). Pass an empty Membership to start a node that will *join*
+// an existing cluster: it stays passive, without campaigning, until a
+// leader adds it with AddServer and replicates the configuration to it.
+//
+// The bootstrap configuration only applies until the node has a snapshot
+// or a configuration entry in its log; after a restart those take
+// precedence.
+func NewNodeWithMembers(id string, members Membership, transport Transport, applyCh chan ApplyMsg, statePath string, snapshotPath ...string) (*Node, error) {
 	sp := ""
 	if len(snapshotPath) > 0 {
 		sp = snapshotPath[0]
 	}
-	n := &Node{
-		id:           id,
-		peers:        peers,
-		statePath:    statePath,
-		snapshotPath: sp,
-		transport:    transport,
-		applyCh:      applyCh,
-		log:          []LogEntry{{Term: 0}},
-		role:         Follower,
-		commitNotify: make(chan struct{}, 1),
-		stopCh:       make(chan struct{}),
+	if members == nil {
+		members = Membership{}
 	}
-	// Restore snapshot first (sets snapshotIndex/snapshotTerm), then
-	// persistent state (may override log with entries after the snapshot).
-	if snap, err := n.LatestSnapshot(); err == nil && snap != nil {
+	n := &Node{
+		id:            id,
+		baseConfig:    members.clone(),
+		statePath:     statePath,
+		snapshotPath:  sp,
+		transport:     transport,
+		applyCh:       applyCh,
+		log:           []LogEntry{{Term: 0}},
+		role:          Follower,
+		commitNotify:  make(chan struct{}, 1),
+		persistNotify: make(chan struct{}, 1),
+		stopCh:        make(chan struct{}),
+		changed:       make(chan struct{}),
+	}
+	snap, err := n.LatestSnapshot()
+	if err != nil {
+		return nil, fmt.Errorf("raft: read snapshot: %w", err)
+	}
+	if snap != nil {
 		n.snapshotIndex = snap.LastIncludedIndex
 		n.snapshotTerm = snap.LastIncludedTerm
+		n.snapshotData = []byte(snap.Data)
 		n.commitIndex = snap.LastIncludedIndex
 		n.lastApplied = snap.LastIncludedIndex
 		n.log = []LogEntry{{Term: snap.LastIncludedTerm}}
+		if snap.Config != nil {
+			n.baseConfig = snap.Config.clone()
+		}
 	}
 	if err := n.restoreState(); err != nil {
 		return nil, fmt.Errorf("raft: restore: %w", err)
 	}
-	if len(n.log) == 0 {
-		n.log = []LogEntry{{Term: 0}}
-	}
+	n.recomputeConfig()
 	transport.Register(id, n)
 	go n.electionLoop()
 	go n.heartbeatLoop()
 	go n.applyLoop()
+	go n.persistLoop()
 	return n, nil
 }
 
-// Stop shuts down the node. Safe to call multiple times.
+// Stop shuts down the node. Safe to call multiple times. After Stop
+// returns, the node ignores incoming RPCs and late RPC replies and never
+// writes to disk again, so its files can be reused by a new Node.
 func (n *Node) Stop() {
-	n.stopOnce.Do(func() { close(n.stopCh) })
+	n.stopOnce.Do(func() {
+		n.mu.Lock()
+		close(n.stopCh)
+		if n.logw != nil {
+			n.logw.Close()
+		}
+		n.mu.Unlock()
+	})
 }
+
+// stopped reports whether Stop has been called. Checked with mu held by
+// every path that mutates state, so a stopped node is inert.
+func (n *Node) stopped() bool {
+	select {
+	case <-n.stopCh:
+		return true
+	default:
+		return false
+	}
+}
+
+// --- Log index helpers (all called with mu held) ---
+
+// lastIndex is the absolute index of the last entry in the log.
+func (n *Node) lastIndex() uint64 { return n.snapshotIndex + uint64(len(n.log)) - 1 }
+
+// termAt returns the term of the entry at absolute index i. Valid for
+// snapshotIndex <= i <= lastIndex().
+func (n *Node) termAt(i uint64) uint64 { return n.log[i-n.snapshotIndex].Term }
+
+// entryAt returns the entry at absolute index i (snapshotIndex < i <= lastIndex()).
+func (n *Node) entryAt(i uint64) LogEntry { return n.log[i-n.snapshotIndex] }
+
+// hasIndex reports whether the log (including the sentinel) covers i.
+func (n *Node) hasIndex(i uint64) bool { return i >= n.snapshotIndex && i <= n.lastIndex() }
+
+func (n *Node) lastLogIndexAndTerm() (uint64, uint64) {
+	last := n.lastIndex()
+	return last, n.termAt(last)
+}
+
+// truncateAfter keeps entries up to and including absolute index i.
+func (n *Node) truncateAfter(i uint64) { n.log = n.log[:i-n.snapshotIndex+1] }
 
 // --- State accessor (safe to call from any goroutine) ---
 
 type NodeState struct {
-	Role     Role
-	Term     uint64
-	LeaderId string
+	Role        Role
+	Term        uint64
+	LeaderId    string
+	CommitIndex uint64
+	LastApplied uint64
 }
 
 func (n *Node) State() NodeState {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	return NodeState{n.role, n.currentTerm, n.leaderId}
+	return NodeState{n.role, n.currentTerm, n.leaderId, n.commitIndex, n.lastApplied}
 }
 
 // --- Election ---
@@ -214,7 +394,7 @@ func (n *Node) electionLoop() {
 		}
 
 		n.mu.Lock()
-		if n.role != Leader && time.Since(n.lastHeartbeat) >= timeout {
+		if !n.stopped() && n.role != Leader && n.isMember(n.id) && time.Since(n.lastHeartbeat) >= timeout {
 			n.startElection() // called with mu held
 		}
 		n.mu.Unlock()
@@ -228,15 +408,21 @@ func (n *Node) startElection() {
 	n.currentTerm++
 	n.role = Candidate
 	n.votedFor = n.id
+	n.leaderId = ""
 	n.lastHeartbeat = time.Now() // prevent back-to-back elections
-	n.persist()                  // must persist before sending RequestVote RPCs
+	n.persistMeta()              // must persist before sending RequestVote RPCs
 
 	term := n.currentTerm
 	lastIdx, lastTerm := n.lastLogIndexAndTerm()
 
-	var votesMu sync.Mutex
-	votes := 1                       // voted for self
-	needed := (len(n.peers)+1)/2 + 1 // majority of total cluster size
+	// Votes are counted against the configuration as of now; guarded by
+	// n.mu.
+	granted := map[string]bool{n.id: true}
+	won := func() bool { return n.hasQuorum(func(id string) bool { return granted[id] }) }
+	if won() {
+		n.becomeLeader() // single-node cluster
+		return
+	}
 
 	for _, peer := range n.peers {
 		go func(peer string) {
@@ -252,6 +438,9 @@ func (n *Node) startElection() {
 
 			n.mu.Lock()
 			defer n.mu.Unlock()
+			if n.stopped() {
+				return
+			}
 
 			if reply.Term > n.currentTerm {
 				n.becomeFollower(reply.Term)
@@ -262,11 +451,8 @@ func (n *Node) startElection() {
 				return
 			}
 			if reply.VoteGranted {
-				votesMu.Lock()
-				votes++
-				won := votes >= needed
-				votesMu.Unlock()
-				if won {
+				granted[peer] = true
+				if won() {
 					n.becomeLeader()
 				}
 			}
@@ -274,27 +460,54 @@ func (n *Node) startElection() {
 	}
 }
 
+// becomeFollower moves to Follower. If term is newer than ours, it adopts
+// the term and clears votedFor. Called with mu held.
+//
+// votedFor is cleared ONLY when the term advances. Clearing it on a
+// same-term message (e.g. the first heartbeat from the leader we just
+// voted for) would let this node grant a second vote in the same term to a
+// late RequestVote from another candidate — two leaders in one term.
 func (n *Node) becomeFollower(term uint64) {
-	// Called with mu held.
+	if n.role != Follower || term > n.currentTerm {
+		n.signal() // wake ReadIndex waiters: leadership lost
+	}
 	n.role = Follower
-	n.currentTerm = term
-	n.votedFor = ""
-	n.persist() //nolint: must persist before any reply
+	if term > n.currentTerm {
+		n.currentTerm = term
+		n.votedFor = ""
+		n.leaderId = ""
+		n.persistMeta() // must persist before any reply
+	}
 }
 
 func (n *Node) becomeLeader() {
 	// Called with mu held. Only reachable from Candidate state.
 	n.role = Leader
 	n.leaderId = n.id
-	lastIdx, _ := n.lastLogIndexAndTerm()
+	lastIdx := n.lastIndex()
 	n.nextIndex = make(map[string]uint64, len(n.peers))
 	n.matchIndex = make(map[string]uint64, len(n.peers))
+	n.snapshotInFlight = make(map[string]bool, len(n.peers))
+	n.ackRound = make(map[string]uint64, len(n.peers))
+	n.lastAck = make(map[string]time.Time, len(n.peers))
+	n.leaderSince = time.Now()
+	n.readRoundOn, n.readsQueued = false, false
+	n.signal()
 	for _, peer := range n.peers {
 		n.nextIndex[peer] = lastIdx + 1
 		n.matchIndex[peer] = 0
 	}
+	// Append a no-op entry for the new term (Raft §8). A leader may only
+	// commit entries from its own term by counting replicas, so without
+	// this, entries left over from earlier terms — including everything
+	// in the log after a full-cluster restart — would stay uncommitted
+	// (and unapplied) until the next client write. No-ops have a nil
+	// Command and are not delivered on applyCh.
+	n.log = append(n.log, LogEntry{Term: n.currentTerm})
+	n.persistEntries(n.lastIndex())
 	// Immediate heartbeat asserts leadership and prevents a new election.
 	n.broadcastAppendEntries()
+	n.maybeAdvanceCommitIndex() // single-node cluster commits immediately
 }
 
 // --- Log replication ---
@@ -308,7 +521,10 @@ func (n *Node) heartbeatLoop() {
 			return
 		case <-ticker.C:
 			n.mu.Lock()
-			if n.role == Leader {
+			if !n.stopped() && n.role == Leader {
+				n.checkQuorum()
+			}
+			if !n.stopped() && n.role == Leader {
 				n.broadcastAppendEntries()
 			}
 			n.mu.Unlock()
@@ -325,20 +541,35 @@ func (n *Node) broadcastAppendEntries() {
 	}
 }
 
-// sendAppendEntries builds and dispatches one AppendEntries RPC to peer.
-// Called with mu held; spawns a goroutine for the actual call.
+// sendAppendEntries builds and dispatches one AppendEntries RPC to peer, or
+// an InstallSnapshot if the entries the peer needs have been compacted
+// away. Called with mu held; spawns a goroutine for the actual call.
 func (n *Node) sendAppendEntries(peer string) {
 	nextIdx := n.nextIndex[peer]
-	if nextIdx < 1 {
-		nextIdx = 1
+	if nextIdx <= n.snapshotIndex {
+		n.sendInstallSnapshot(peer)
+		return
+	}
+	if last := n.lastIndex(); nextIdx > last+1 {
+		nextIdx = last + 1
 	}
 	prevLogIndex := nextIdx - 1
-	prevLogTerm := n.log[prevLogIndex].Term
+	prevLogTerm := n.termAt(prevLogIndex)
 
 	var entries []LogEntry
-	if uint64(len(n.log)) > nextIdx {
-		entries = make([]LogEntry, uint64(len(n.log))-nextIdx)
-		copy(entries, n.log[nextIdx:])
+	if n.lastIndex() >= nextIdx {
+		// Cap the batch so one RPC stays well under the transport's message
+		// limit: a follower far behind catches up over several RPCs. (An
+		// uncapped batch over the limit was rejected every time, so the
+		// follower could never catch up.) Always send at least one entry.
+		src := n.log[nextIdx-n.snapshotIndex:]
+		size, k := 0, 0
+		for k < len(src) && (k == 0 || size+len(src[k].Command) <= maxAppendBytes) {
+			size += len(src[k].Command) + 32
+			k++
+		}
+		entries = make([]LogEntry, k)
+		copy(entries, src[:k])
 	}
 
 	args := AppendEntriesArgs{
@@ -350,6 +581,7 @@ func (n *Node) sendAppendEntries(peer string) {
 		LeaderCommit: n.commitIndex,
 	}
 	term := n.currentTerm
+	round := n.hbRound
 
 	go func() {
 		reply, err := n.transport.AppendEntries(peer, args)
@@ -359,14 +591,19 @@ func (n *Node) sendAppendEntries(peer string) {
 
 		n.mu.Lock()
 		defer n.mu.Unlock()
+		if n.stopped() {
+			return
+		}
 
 		if reply.Term > n.currentTerm {
 			n.becomeFollower(reply.Term)
 			return
 		}
-		if n.role != Leader || n.currentTerm != term {
-			return // stale reply
+		if n.role != Leader || n.currentTerm != term || !n.isMember(peer) {
+			return // stale reply, or the peer was removed meanwhile
 		}
+		// Success or not, the peer accepted us as leader for this term.
+		n.recordAck(peer, round)
 
 		if reply.Success {
 			newMatch := args.PrevLogIndex + uint64(len(args.Entries))
@@ -375,32 +612,89 @@ func (n *Node) sendAppendEntries(peer string) {
 			}
 			n.nextIndex[peer] = n.matchIndex[peer] + 1
 			n.maybeAdvanceCommitIndex()
-		} else {
-			// Fast backup: use conflict hints to jump nextIndex to the right
-			// spot rather than decrementing one entry at a time.
-			if reply.ConflictTerm != 0 {
-				// Find the last entry in our log with ConflictTerm.
-				found := uint64(0)
-				for i := uint64(len(n.log) - 1); i > 0; i-- {
-					if n.log[i].Term == reply.ConflictTerm {
-						found = i
-						break
-					}
-				}
-				if found > 0 {
-					n.nextIndex[peer] = found + 1
-				} else {
-					n.nextIndex[peer] = reply.ConflictIndex
-				}
-			} else if reply.ConflictIndex > 0 {
-				n.nextIndex[peer] = reply.ConflictIndex
-			} else if n.nextIndex[peer] > 1 {
-				n.nextIndex[peer]--
-			}
-			// Retry immediately so the follower catches up without waiting
-			// for the next heartbeat tick.
-			n.sendAppendEntries(peer)
+			return
 		}
+		// Fast backup: use conflict hints to jump nextIndex to the right
+		// spot rather than decrementing one entry at a time. If the jump
+		// lands at or below our snapshot, the next send becomes an
+		// InstallSnapshot.
+		next := n.nextIndex[peer]
+		if reply.ConflictTerm != 0 {
+			found := uint64(0)
+			for i := n.lastIndex(); i > n.snapshotIndex; i-- {
+				if n.termAt(i) == reply.ConflictTerm {
+					found = i
+					break
+				}
+			}
+			if found > 0 {
+				next = found + 1
+			} else {
+				next = reply.ConflictIndex
+			}
+		} else if reply.ConflictIndex > 0 {
+			next = reply.ConflictIndex
+		} else if next > 1 {
+			next--
+		}
+		if next <= n.matchIndex[peer] {
+			next = n.matchIndex[peer] + 1 // never regress below known-good
+		}
+		n.nextIndex[peer] = next
+		// Retry immediately so the follower catches up without waiting
+		// for the next heartbeat tick.
+		n.sendAppendEntries(peer)
+	}()
+}
+
+// sendInstallSnapshot ships the current snapshot to a peer whose nextIndex
+// is at or below our compaction point. At most one is in flight per peer,
+// since snapshots can be large and heartbeats fire every 50ms.
+// Called with mu held.
+func (n *Node) sendInstallSnapshot(peer string) {
+	if n.snapshotInFlight[peer] {
+		return
+	}
+	n.snapshotInFlight[peer] = true
+	args := InstallSnapshotArgs{
+		Term:              n.currentTerm,
+		LeaderId:          n.id,
+		LastIncludedIndex: n.snapshotIndex,
+		LastIncludedTerm:  n.snapshotTerm,
+		Data:              n.snapshotData,
+		Config:            n.baseConfig.clone(),
+	}
+	term := n.currentTerm
+	round := n.hbRound
+
+	go func() {
+		reply, err := n.transport.InstallSnapshot(peer, args)
+
+		n.mu.Lock()
+		defer n.mu.Unlock()
+		if n.stopped() {
+			return
+		}
+		if n.currentTerm == term && n.snapshotInFlight != nil {
+			n.snapshotInFlight[peer] = false
+		}
+		if err != nil {
+			return
+		}
+		if reply.Term > n.currentTerm {
+			n.becomeFollower(reply.Term)
+			return
+		}
+		if n.role != Leader || n.currentTerm != term || !n.isMember(peer) {
+			return
+		}
+		n.recordAck(peer, round)
+		if args.LastIncludedIndex > n.matchIndex[peer] {
+			n.matchIndex[peer] = args.LastIncludedIndex
+		}
+		n.nextIndex[peer] = n.matchIndex[peer] + 1
+		n.maybeAdvanceCommitIndex()
+		n.sendAppendEntries(peer) // follow up with any entries after the snapshot
 	}()
 }
 
@@ -415,24 +709,75 @@ func (n *Node) sendAppendEntries(peer string) {
 // the commit point is also committed). Without this rule, a leader could
 // incorrectly commit an old entry that gets overwritten by a future leader.
 func (n *Node) maybeAdvanceCommitIndex() {
-	for idx := uint64(len(n.log) - 1); idx > n.commitIndex; idx-- {
-		if n.log[idx].Term != n.currentTerm {
+	floor := n.commitIndex
+	if n.snapshotIndex > floor {
+		floor = n.snapshotIndex
+	}
+	for idx := n.lastIndex(); idx > floor; idx-- {
+		if n.termAt(idx) != n.currentTerm {
 			continue
 		}
-		count := 1 // self
-		for _, peer := range n.peers {
-			if n.matchIndex[peer] >= idx {
-				count++
+		stored := func(id string) bool {
+			if id == n.id {
+				return n.selfDurable(idx)
 			}
+			return n.matchIndex[id] >= idx
 		}
-		if count*2 > len(n.peers)+1 { // majority
+		if n.hasQuorum(stored) { // majority of the current configuration
 			n.commitIndex = idx
-			select {
-			case n.commitNotify <- struct{}{}:
-			default:
-			}
+			n.notifyApply()
+			n.stepDownIfRemoved()
 			break
 		}
+	}
+}
+
+// notifyApply is called whenever commitIndex advances (or a snapshot is
+// installed): it wakes applyLoop and any ReadIndex waiters.
+func (n *Node) notifyApply() {
+	select {
+	case n.commitNotify <- struct{}{}:
+	default:
+	}
+	n.signal()
+}
+
+// signal wakes every goroutine waiting on n.changed. Called with mu held.
+func (n *Node) signal() {
+	close(n.changed)
+	n.changed = make(chan struct{})
+}
+
+// checkQuorum steps a leader down if a majority of the configuration
+// hasn't answered it within the maximum election timeout (etcd's
+// CheckQuorum). This is the necessary partner of ignoring RequestVote
+// while a leader is alive (§4.2.3): without it, a leader cut off from the
+// majority but still reaching a few followers keeps those followers
+// ignoring candidates, and no one else can gather a majority — the
+// cluster stalls until the partition heals (TestLeaderWithoutQuorumStepsDown).
+// Stepping down doesn't change the term; it just frees the followers to
+// vote. Called with mu held.
+func (n *Node) checkQuorum() {
+	now := time.Now()
+	if now.Sub(n.leaderSince) < electionTimeoutMax {
+		return // grace period: peers haven't had a chance to answer yet
+	}
+	active := n.hasQuorum(func(id string) bool {
+		return id == n.id || now.Sub(n.lastAck[id]) < electionTimeoutMax
+	})
+	if !active {
+		n.role = Follower
+		n.leaderId = ""
+		n.signal()
+	}
+}
+
+func (n *Node) recordAck(peer string, round uint64) {
+	n.lastAck[peer] = time.Now()
+	if round > n.ackRound[peer] {
+		n.ackRound[peer] = round
+		n.advanceReadRound()
+		n.signal()
 	}
 }
 
@@ -441,8 +786,18 @@ func (n *Node) maybeAdvanceCommitIndex() {
 func (n *Node) HandleRequestVote(args RequestVoteArgs) RequestVoteReply {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	if n.stopped() {
+		return RequestVoteReply{Term: n.currentTerm}
+	}
 
 	if args.Term < n.currentTerm {
+		return RequestVoteReply{Term: n.currentTerm, VoteGranted: false}
+	}
+	// §4.2.3: while we believe a leader is alive, ignore candidates
+	// entirely (don't even adopt their term). Otherwise a server removed
+	// from the cluster, which no longer gets heartbeats, would keep timing
+	// out and forcing pointless elections with ever-higher terms.
+	if args.Term > n.currentTerm && n.leaderAlive() {
 		return RequestVoteReply{Term: n.currentTerm, VoteGranted: false}
 	}
 	if args.Term > n.currentTerm {
@@ -458,8 +813,10 @@ func (n *Node) HandleRequestVote(args RequestVoteArgs) RequestVoteReply {
 	canVote := n.votedFor == "" || n.votedFor == args.CandidateId
 
 	if logOK && canVote {
-		n.votedFor = args.CandidateId
-		n.persist()                  // must persist votedFor before granting vote
+		if n.votedFor != args.CandidateId {
+			n.votedFor = args.CandidateId
+			n.persistMeta() // must persist votedFor before granting vote
+		}
 		n.lastHeartbeat = time.Now() // reset election timer on granting a vote
 		return RequestVoteReply{Term: n.currentTerm, VoteGranted: true}
 	}
@@ -469,130 +826,264 @@ func (n *Node) HandleRequestVote(args RequestVoteArgs) RequestVoteReply {
 func (n *Node) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	if n.stopped() {
+		return AppendEntriesReply{Term: n.currentTerm}
+	}
 
 	if args.Term < n.currentTerm {
 		return AppendEntriesReply{Term: n.currentTerm, Success: false}
 	}
-	if args.Term >= n.currentTerm {
-		n.becomeFollower(args.Term)
-		n.leaderId = args.LeaderId
-	}
+	n.becomeFollower(args.Term) // also steps down a same-term candidate
+	n.leaderId = args.LeaderId
 	n.lastHeartbeat = time.Now() // valid message from current leader
+	n.lastLeaderContact = n.lastHeartbeat
 
-	// Log consistency check: our log must contain an entry at PrevLogIndex
-	// with term PrevLogTerm, otherwise the follower's log diverges from the
+	// Entries at or below our snapshot are committed and already reflected
+	// in it. Skip that prefix and check consistency at the snapshot point
+	// instead, where the term is known from the snapshot.
+	entries := args.Entries
+	prevIdx, prevTerm := args.PrevLogIndex, args.PrevLogTerm
+	if prevIdx < n.snapshotIndex {
+		skip := n.snapshotIndex - prevIdx
+		if skip >= uint64(len(entries)) {
+			// Everything in this RPC is already covered by our snapshot.
+			return AppendEntriesReply{Term: n.currentTerm, Success: true}
+		}
+		entries = entries[skip:]
+		prevIdx, prevTerm = n.snapshotIndex, n.snapshotTerm
+	}
+
+	// Log consistency check: our log must contain an entry at prevIdx with
+	// term prevTerm, otherwise the follower's log diverges from the
 	// leader's at some earlier point and we must reject.
-	if args.PrevLogIndex >= uint64(len(n.log)) {
+	if prevIdx > n.lastIndex() {
 		return AppendEntriesReply{
 			Term:          n.currentTerm,
 			Success:       false,
-			ConflictIndex: uint64(len(n.log)), // tell leader our log length
-			ConflictTerm:  0,
+			ConflictIndex: n.lastIndex() + 1, // tell leader where our log ends
 		}
 	}
-	if n.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		conflictTerm := n.log[args.PrevLogIndex].Term
-		// Find the first index where this conflicting term appears, so the
-		// leader can skip the whole term in one round-trip.
-		conflictIndex := args.PrevLogIndex
-		for conflictIndex > 1 && n.log[conflictIndex-1].Term == conflictTerm {
+	if t := n.termAt(prevIdx); t != prevTerm {
+		// Find the first index of the conflicting term, so the leader can
+		// skip the whole term in one round-trip.
+		conflictIndex := prevIdx
+		for conflictIndex > n.snapshotIndex+1 && n.termAt(conflictIndex-1) == t {
 			conflictIndex--
 		}
 		return AppendEntriesReply{
 			Term:          n.currentTerm,
 			Success:       false,
 			ConflictIndex: conflictIndex,
-			ConflictTerm:  conflictTerm,
+			ConflictTerm:  t,
 		}
 	}
 
-	// Append new entries, removing any conflicting tail first.
-	for i, entry := range args.Entries {
-		idx := args.PrevLogIndex + uint64(i) + 1
-		if idx < uint64(len(n.log)) {
-			if n.log[idx].Term != entry.Term {
-				n.log = n.log[:idx] // truncate divergent suffix
-			} else {
+	// Append new entries, removing any conflicting tail first. Entries we
+	// already have with matching terms are skipped, so a retried or
+	// reordered RPC never truncates entries that a newer RPC appended.
+	changed := false
+	var firstChanged uint64
+	for i, entry := range entries {
+		idx := prevIdx + uint64(i) + 1
+		if idx <= n.lastIndex() {
+			if n.termAt(idx) == entry.Term {
 				continue // already have this (idempotent on retry)
 			}
+			n.truncateAfter(idx - 1) // truncate divergent suffix
 		}
-		n.log = append(n.log, entry)
+		n.log = append(n.log, entries[i:]...)
+		changed, firstChanged = true, idx
+		break
 	}
-	if len(args.Entries) > 0 {
-		n.persist() // must persist log changes before replying success
+	if changed {
+		n.persistEntries(firstChanged)      // must persist log changes before replying success
+		n.recomputeConfigFrom(firstChanged) // config entries take effect on append (or revert on truncation)
 	}
 
-	// Advance commitIndex to match the leader, bounded by our log length.
+	// Advance commitIndex to match the leader, bounded by the last entry
+	// this RPC proved we share with the leader.
 	if args.LeaderCommit > n.commitIndex {
-		lastNew := args.PrevLogIndex + uint64(len(args.Entries))
-		if args.LeaderCommit < lastNew {
-			n.commitIndex = args.LeaderCommit
-		} else {
-			n.commitIndex = lastNew
+		lastNew := prevIdx + uint64(len(entries))
+		newCommit := args.LeaderCommit
+		if lastNew < newCommit {
+			newCommit = lastNew
 		}
-		select {
-		case n.commitNotify <- struct{}{}:
-		default:
+		if newCommit > n.commitIndex {
+			n.commitIndex = newCommit
+			n.notifyApply()
 		}
 	}
 
 	return AppendEntriesReply{Term: n.currentTerm, Success: true}
 }
 
+// HandleInstallSnapshot replaces this follower's state with the leader's
+// snapshot when the follower is too far behind to be caught up from the
+// leader's (compacted) log.
+func (n *Node) HandleInstallSnapshot(args InstallSnapshotArgs) InstallSnapshotReply {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.stopped() {
+		return InstallSnapshotReply{Term: n.currentTerm}
+	}
+
+	if args.Term < n.currentTerm {
+		return InstallSnapshotReply{Term: n.currentTerm}
+	}
+	n.becomeFollower(args.Term)
+	n.leaderId = args.LeaderId
+	n.lastHeartbeat = time.Now()
+	n.lastLeaderContact = n.lastHeartbeat
+
+	// Already have everything this snapshot contains (and it's committed):
+	// installing it would move the state machine backwards.
+	if args.LastIncludedIndex <= n.commitIndex {
+		return InstallSnapshotReply{Term: n.currentTerm}
+	}
+
+	// If our log has the snapshot's last entry with a matching term, the
+	// entries after it are still valid (Log Matching); keep them.
+	// Otherwise our whole log is superseded.
+	newLog := []LogEntry{{Term: args.LastIncludedTerm}}
+	if n.hasIndex(args.LastIncludedIndex) && n.termAt(args.LastIncludedIndex) == args.LastIncludedTerm {
+		newLog = append(newLog, n.log[args.LastIncludedIndex-n.snapshotIndex+1:]...)
+	}
+
+	snap := Snapshot{
+		LastIncludedIndex: args.LastIncludedIndex,
+		LastIncludedTerm:  args.LastIncludedTerm,
+		Data:              args.Data,
+		Config:            args.Config,
+	}
+	if err := n.writeSnapshot(snap); err != nil {
+		// Can't make the snapshot durable: don't adopt it. The leader
+		// will retry.
+		return InstallSnapshotReply{Term: n.currentTerm}
+	}
+	n.log = newLog
+	n.snapshotIndex = args.LastIncludedIndex
+	n.snapshotTerm = args.LastIncludedTerm
+	n.snapshotData = args.Data
+	if args.Config != nil {
+		n.baseConfig = args.Config.clone()
+	}
+	n.rewriteLog()
+	n.recomputeConfig()
+
+	n.commitIndex = args.LastIncludedIndex
+	n.lastApplied = args.LastIncludedIndex
+	n.pendingSnap = &ApplyMsg{
+		SnapshotValid: true,
+		Snapshot:      args.Data,
+		SnapshotIndex: args.LastIncludedIndex,
+		SnapshotTerm:  args.LastIncludedTerm,
+	}
+	n.notifyApply()
+	return InstallSnapshotReply{Term: n.currentTerm}
+}
+
 // --- Client interface ---
 
 // Propose submits a command to be replicated. Returns (logIndex, term, isLeader).
 // If isLeader is false, this node is not the current leader and the command
-// was not submitted — the client should retry on another node (or wait for
-// redirection, which is not implemented here).
+// was not submitted — the client should retry on another node.
+//
+// A true return does NOT mean the command is committed. It is committed
+// once an ApplyMsg arrives with CommandIndex == logIndex and
+// CommandTerm == term; if one arrives at logIndex with a different term,
+// the proposal was overwritten by a new leader and was lost.
 func (n *Node) Propose(command []byte) (uint64, uint64, bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	if n.role != Leader {
+	if n.role != Leader || n.stopped() {
 		return 0, n.currentTerm, false
 	}
-	entry := LogEntry{Term: n.currentTerm, Command: command}
-	n.log = append(n.log, entry)
-	idx := uint64(len(n.log) - 1)
-	n.matchIndex[n.id] = idx // leader counts itself
-	n.persist()              // persist before broadcasting
+	n.log = append(n.log, LogEntry{Term: n.currentTerm, Command: command})
+	idx := n.lastIndex()
+	// Replicate now and fsync locally in the background: persistLoop
+	// batches every proposal that arrives meanwhile into one fsync. Safe
+	// because the leader doesn't count itself toward a majority for an
+	// entry until it is durable (maybeAdvanceCommitIndex).
+	select {
+	case n.persistNotify <- struct{}{}:
+	default:
+	}
 	n.broadcastAppendEntries()
+	n.maybeAdvanceCommitIndex() // in-memory single-node clusters commit immediately
 	return idx, n.currentTerm, true
+}
+
+// persistLoop fsyncs log entries the leader has appended but not yet made
+// durable, then re-checks the commit index. Holding mu during the write
+// keeps file order identical to log order (a step-down can't interleave a
+// truncation), and lets every Propose that queues on mu meanwhile land in
+// the next batch.
+func (n *Node) persistLoop() {
+	for {
+		select {
+		case <-n.stopCh:
+			return
+		case <-n.persistNotify:
+		}
+		n.mu.Lock()
+		if !n.stopped() && n.durableIndex < n.lastIndex() {
+			n.persistEntries(n.durableIndex + 1)
+			if n.role == Leader {
+				n.maybeAdvanceCommitIndex()
+			}
+		}
+		n.mu.Unlock()
+	}
+}
+
+// selfDurable reports whether this node may count itself as storing idx.
+func (n *Node) selfDurable(idx uint64) bool {
+	return n.statePath == "" || n.durableIndex >= idx
 }
 
 // --- Apply loop ---
 
-// applyLoop watches for commitIndex advancing past lastApplied and sends
-// committed entries to applyCh for the state machine (Store) to consume.
+// applyLoop is the only goroutine that sends on applyCh. It delivers, in
+// order: any snapshot installed from the leader, then every committed entry
+// past lastApplied.
 func (n *Node) applyLoop() {
 	for {
 		select {
 		case <-n.stopCh:
 			return
 		case <-n.commitNotify:
-			n.mu.Lock()
-			for n.lastApplied < n.commitIndex {
+		}
+		n.mu.Lock()
+		for {
+			var msg ApplyMsg
+			if n.pendingSnap != nil {
+				msg = *n.pendingSnap
+				n.pendingSnap = nil
+			} else if n.lastApplied < n.commitIndex {
 				n.lastApplied++
-				entry := n.log[n.lastApplied]
-				idx := n.lastApplied
-				n.mu.Unlock()
-
-				if entry.Command != nil {
-					select {
-					case n.applyCh <- ApplyMsg{CommandIndex: idx, Command: entry.Command}:
-					case <-n.stopCh:
-						return
-					}
+				e := n.entryAt(n.lastApplied)
+				if !e.delivered() {
+					continue // no-ops and config entries aren't for the state machine
 				}
-				n.mu.Lock()
+				msg = ApplyMsg{CommandIndex: n.lastApplied, CommandTerm: e.Term, Command: e.Command}
+			} else {
+				break
 			}
 			n.mu.Unlock()
+			select {
+			case n.applyCh <- msg:
+			case <-n.stopCh:
+				return
+			}
+			n.mu.Lock()
 		}
+		n.mu.Unlock()
 	}
 }
 
-// LogSnapshot returns a copy of the current log (for testing/inspection).
+// LogSnapshot returns a copy of the in-memory log (for testing/inspection).
+// Element 0 is the sentinel for the last compacted index (see SnapshotIndex).
 func (n *Node) LogSnapshot() []LogEntry {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -601,9 +1092,20 @@ func (n *Node) LogSnapshot() []LogEntry {
 	return out
 }
 
-func (n *Node) lastLogIndexAndTerm() (uint64, uint64) {
-	last := uint64(len(n.log) - 1)
-	return last, n.log[last].Term
+// SnapshotIndex returns the absolute index of the last compacted entry.
+func (n *Node) SnapshotIndex() uint64 {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.snapshotIndex
+}
+
+// leaderAlive reports whether this node is the leader or has heard from
+// one within the minimum election timeout. Called with mu held.
+func (n *Node) leaderAlive() bool {
+	if n.role == Leader {
+		return true
+	}
+	return n.leaderId != "" && time.Since(n.lastLeaderContact) < electionTimeoutMin
 }
 
 func randDuration(min, max time.Duration) time.Duration {

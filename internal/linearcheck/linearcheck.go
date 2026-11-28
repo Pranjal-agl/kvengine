@@ -3,12 +3,24 @@
 // verifies they can be arranged into a legal sequential order consistent
 // with real time — the formal definition of linearizability.
 //
-// Algorithm: Wing & Gong (1993), adapted for a KV store state machine.
-// Exponential worst-case but fast in practice for small histories (≤ ~20 ops)
-// because the partial order from timestamps prunes the search space heavily.
+// Algorithm: Wing & Gong (1993) backtracking search, with the two
+// optimisations that make it practical on real histories (both used by
+// checkers such as Lowe's and Porcupine):
+//
+//   - Per-key decomposition. Linearizability is local (Herlihy & Wing):
+//     a history over independent objects is linearizable iff each object's
+//     sub-history is. Every key of a KV store is an independent register,
+//     so each key is checked on its own.
+//   - Memoisation. The search state is (set of ops already linearized,
+//     register value). Two paths that reach the same state have the same
+//     future, so a state that failed once is never explored again.
+//
+// Without these, a 60-op history could take many minutes; with them,
+// thousands of heavily overlapping ops check in well under a second.
 package linearcheck
 
 import (
+	"encoding/binary"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -90,99 +102,109 @@ func (r *Recorder) Ops() []Op {
 	return out
 }
 
-// kvState is the reference sequential state machine: a simple map.
-type kvState struct {
-	data map[string]string
-}
-
-func newKVState() *kvState {
-	return &kvState{data: make(map[string]string)}
-}
-
-func (s *kvState) clone() *kvState {
-	c := &kvState{data: make(map[string]string, len(s.data))}
-	for k, v := range s.data {
-		c.data[k] = v
-	}
-	return c
-}
-
-// apply attempts to apply op to state and checks whether the result matches
-// what was actually observed. Returns (new state, ok).
-func (s *kvState) apply(op Op) (*kvState, bool) {
-	next := s.clone()
-	switch op.Type {
-	case OpPut:
-		next.data[op.Key] = op.Value
-		return next, true // Put always succeeds
-	case OpDelete:
-		delete(next.data, op.Key)
-		return next, true // Delete is idempotent, always succeeds
-	case OpGet:
-		v, found := next.data[op.Key]
-		if found != op.Found {
-			return nil, false
-		}
-		if found && v != op.Value {
-			return nil, false
-		}
-		return next, true
-	}
-	return nil, false
-}
-
 // Check verifies that ops is a linearizable history for a KV store.
-// Returns nil if linearizable, or an error describing the violation.
+// Returns nil if linearizable, or an error naming the first key whose
+// sub-history has no valid linearization.
 //
-// Uses recursive backtracking: at each step, try every op whose Start is
-// before any other op's End (i.e. it could have "happened first" in a
-// valid sequential order). If applying it matches the observed result,
-// recurse with it removed. If we can empty the op list, the history is
-// linearizable.
-//
-// Limit: this is O(n!) worst case. For histories up to ~16 ops it's fast;
-// for larger histories use the -short flag to skip linearizability tests.
+// An op may be linearized next only if it started no later than the
+// earliest end among the ops not yet linearized; otherwise that op would
+// have to take effect after some op that finished before it began.
 func Check(ops []Op) error {
-	if len(ops) == 0 {
-		return nil
+	byKey := make(map[string][]Op)
+	var keys []string
+	for _, op := range ops {
+		if _, seen := byKey[op.Key]; !seen {
+			keys = append(keys, op.Key)
+		}
+		byKey[op.Key] = append(byKey[op.Key], op)
 	}
-	if err := check(newKVState(), ops); err != nil {
-		return fmt.Errorf("not linearizable: %w", err)
+	for _, k := range keys {
+		if !checkKey(byKey[k]) {
+			return fmt.Errorf("not linearizable: no valid linearization for the %d ops on key %q",
+				len(byKey[k]), k)
+		}
 	}
 	return nil
 }
 
-func check(state *kvState, remaining []Op) error {
-	if len(remaining) == 0 {
-		return nil
-	}
-
-	// Find the earliest End time — no op can be sequenced after this
-	// endpoint without violating real-time order.
-	earliest := remaining[0].End
-	for _, op := range remaining[1:] {
-		if op.End.Before(earliest) {
-			earliest = op.End
-		}
-	}
-
-	// Try sequencing each op whose Start is before earliest End.
-	// These are the ops that "could" have completed first.
-	for i, op := range remaining {
-		if op.Start.After(earliest) {
-			continue // this op started after the earliest completion — can't be first
-		}
-		nextState, ok := state.apply(op)
-		if !ok {
-			continue // applying this op here doesn't match the observed result
-		}
-		// Remove op[i] from remaining and recurse.
-		rest := make([]Op, 0, len(remaining)-1)
-		rest = append(rest, remaining[:i]...)
-		rest = append(rest, remaining[i+1:]...)
-		if err := check(nextState, rest); err == nil {
-			return nil // found a valid linearization
-		}
-	}
-	return fmt.Errorf("no valid linearization found for %d remaining ops", len(remaining))
+// register is the sequential model for one key.
+type register struct {
+	present bool
+	value   string
 }
+
+// step applies op to r. ok is false if op is a Get whose observed result
+// doesn't match r.
+func (r register) step(op Op) (next register, ok bool) {
+	switch op.Type {
+	case OpPut:
+		return register{true, op.Value}, true
+	case OpDelete:
+		return register{}, true
+	case OpGet:
+		if op.Found != r.present || (op.Found && op.Value != r.value) {
+			return r, false
+		}
+		return r, true
+	}
+	return r, false
+}
+
+func checkKey(ops []Op) bool {
+	n := len(ops)
+	done := make([]uint64, (n+63)/64)
+	failed := make(map[string]struct{})
+
+	var search func(r register, remaining int) bool
+	search = func(r register, remaining int) bool {
+		if remaining == 0 {
+			return true
+		}
+		memo := stateKey(done, r)
+		if _, bad := failed[memo]; bad {
+			return false
+		}
+		var earliest time.Time
+		first := true
+		for i := 0; i < n; i++ {
+			if !isSet(done, i) && (first || ops[i].End.Before(earliest)) {
+				earliest, first = ops[i].End, false
+			}
+		}
+		for i := 0; i < n; i++ {
+			if isSet(done, i) || ops[i].Start.After(earliest) {
+				continue
+			}
+			next, ok := r.step(ops[i])
+			if !ok {
+				continue
+			}
+			set(done, i)
+			if search(next, remaining-1) {
+				return true
+			}
+			unset(done, i)
+		}
+		failed[memo] = struct{}{}
+		return false
+	}
+	return search(register{}, n)
+}
+
+func stateKey(done []uint64, r register) string {
+	b := make([]byte, 0, len(done)*8+2+len(r.value))
+	for _, w := range done {
+		b = binary.LittleEndian.AppendUint64(b, w)
+	}
+	if r.present {
+		b = append(b, 1)
+		b = append(b, r.value...)
+	} else {
+		b = append(b, 0)
+	}
+	return string(b)
+}
+
+func isSet(bits []uint64, i int) bool { return bits[i/64]&(1<<(i%64)) != 0 }
+func set(bits []uint64, i int)        { bits[i/64] |= 1 << (i % 64) }
+func unset(bits []uint64, i int)      { bits[i/64] &^= 1 << (i % 64) }

@@ -1,6 +1,7 @@
 package wal
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -107,5 +108,50 @@ func TestReplayTornTail(t *testing.T) {
 		if string(got[i].Key) != string(full[i].Key) {
 			t.Errorf("record %d: got key %q, want %q", i, got[i].Key, full[i].Key)
 		}
+	}
+}
+
+// TestOpenTruncatesTornTail: Open must cut a torn tail off before appending,
+// keep the discarded bytes in a side file, and leave every record (old and
+// new) replayable.
+func TestOpenTruncatesTornTail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "torn.wal")
+	w, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.Append(Record{Type: RecordPut, Key: []byte("k1"), Value: []byte("v1")})
+	if err := w.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	validSize := w.DurableOffset()
+	w.Close()
+
+	garbage := []byte{1, 2, 3, 4, 5}
+	f, _ := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o644)
+	f.Write(garbage)
+	f.Close()
+
+	w, recs, err := OpenAndReplay(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recs) != 1 {
+		t.Fatalf("got %d records, want 1", len(recs))
+	}
+	if got := w.DurableOffset(); got != validSize {
+		t.Fatalf("durable offset after recovery = %d, want %d", got, validSize)
+	}
+	side, err := os.ReadFile(fmt.Sprintf("%s.corrupt-%d", path, validSize))
+	if err != nil || string(side) != string(garbage) {
+		t.Fatalf("discarded tail not preserved: %q, %v", side, err)
+	}
+	w.Append(Record{Type: RecordPut, Key: []byte("k2"), Value: []byte("v2")})
+	w.Sync()
+	w.Close()
+
+	recs, _ = Replay(path)
+	if len(recs) != 2 || string(recs[1].Key) != "k2" {
+		t.Fatalf("record written after recovery not replayable: %+v", recs)
 	}
 }

@@ -43,6 +43,11 @@ func TestPersistenceAcrossRestart(t *testing.T) {
 	for i, id := range ids {
 		nodes[i] = mkNode(id, peers(id), chs[i])
 	}
+	t.Cleanup(func() {
+		for _, n := range nodes {
+			n.Stop()
+		}
+	})
 
 	// Wait for a leader to emerge.
 	var leaderIdx int

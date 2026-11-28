@@ -10,70 +10,87 @@ import (
 // prefix before that point can be safely discarded. This solves the
 // "log grows forever" problem.
 //
-// Raft paper §7: once a snapshot is taken at index N, log entries 1..N-1
-// can be deleted. The snapshot stores the last included index and term so
-// the node can still answer "what was log[N].Term?" for AppendEntries
-// consistency checks — the answer comes from the snapshot header, not the
-// (now truncated) log.
+// Raft paper §7: once a snapshot is taken at index N, log entries 1..N can
+// be deleted. The snapshot stores the last included index and term so the
+// node can still answer "what was the term at N?" for AppendEntries
+// consistency checks — the answer comes from the snapshot, not the (now
+// truncated) log.
 type Snapshot struct {
 	LastIncludedIndex uint64          `json:"last_included_index"`
 	LastIncludedTerm  uint64          `json:"last_included_term"`
-	Data              json.RawMessage `json:"data"` // opaque state machine bytes
+	Data              json.RawMessage `json:"data"` // opaque state machine bytes (must be valid JSON)
+	// Config is the cluster membership as of LastIncludedIndex. Nil in
+	// snapshots written before membership changes existed.
+	Config Membership `json:"config,omitempty"`
 }
 
 // TakeSnapshot compacts the log up to (and including) upToIndex.
-// upToIndex must be <= commitIndex — we can only snapshot committed state.
-// The state machine data is whatever the caller passes in (e.g. a JSON
-// snapshot of the Store's in-memory map).
+// stateMachineData must be the state machine's state after applying
+// exactly the entries up to upToIndex, and upToIndex must already have been
+// delivered on applyCh. It must be valid JSON (it is embedded in the
+// snapshot file as-is).
 //
-// After this call, log entries 1..upToIndex are deleted. The sentinel at
-// log[0] is replaced with a dummy entry carrying LastIncludedTerm so that
-// prevLogTerm lookups still work for the first real entry after the snapshot.
+// After this call, entries up to upToIndex are gone from memory and disk;
+// log[0] becomes a sentinel carrying upToIndex's term so prevLogTerm lookups
+// at the compaction point still work. Calling with an index at or below the
+// current snapshot is a no-op.
 func (n *Node) TakeSnapshot(upToIndex uint64, stateMachineData []byte) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	if upToIndex > n.commitIndex {
-		return fmt.Errorf("raft: TakeSnapshot: upToIndex %d > commitIndex %d", upToIndex, n.commitIndex)
+	if upToIndex <= n.snapshotIndex || n.stopped() {
+		return nil // already compacted past this point (or shut down)
 	}
-	if upToIndex < n.snapshotIndex {
-		return nil // already compacted past this point
+	if upToIndex > n.lastApplied {
+		return fmt.Errorf("raft: TakeSnapshot: upToIndex %d > lastApplied %d", upToIndex, n.lastApplied)
 	}
-	if upToIndex >= uint64(len(n.log)) {
-		return fmt.Errorf("raft: TakeSnapshot: upToIndex %d out of range (log len %d)", upToIndex, len(n.log))
+	if !json.Valid(stateMachineData) {
+		return fmt.Errorf("raft: TakeSnapshot: state machine data is not valid JSON")
 	}
 
-	lastTerm := n.log[upToIndex].Term
-
+	lastTerm := n.termAt(upToIndex)
+	cfg, _ := n.configAt(upToIndex)
 	snap := Snapshot{
 		LastIncludedIndex: upToIndex,
 		LastIncludedTerm:  lastTerm,
 		Data:              json.RawMessage(stateMachineData),
+		Config:            cfg.clone(),
 	}
+	// Snapshot first, then the truncated log: if we crash in between, the
+	// old log still covers everything (see restoreState).
 	if err := n.writeSnapshot(snap); err != nil {
 		return err
 	}
 
-	// Truncate the log: keep entries after upToIndex, but replace log[0]
-	// with a sentinel that carries lastTerm so prevLogTerm lookups work.
-	newLog := make([]LogEntry, 1, uint64(len(n.log))-upToIndex)
+	newLog := make([]LogEntry, 1, n.lastIndex()-upToIndex+1)
 	newLog[0] = LogEntry{Term: lastTerm} // sentinel with preserved term
-	newLog = append(newLog, n.log[upToIndex+1:]...)
+	newLog = append(newLog, n.log[upToIndex-n.snapshotIndex+1:]...)
 	n.log = newLog
-
 	n.snapshotIndex = upToIndex
 	n.snapshotTerm = lastTerm
-	return n.persist()
+	n.snapshotData = stateMachineData
+	n.baseConfig = cfg.clone()
+	if n.configIndex < upToIndex {
+		n.configIndex = upToIndex // the config entry was compacted into the base
+	}
+	n.rewriteLog()
+	return nil
 }
 
 // LatestSnapshot returns the most recently saved snapshot, or nil if none.
+// With no snapshot path configured, returns the in-memory snapshot.
 func (n *Node) LatestSnapshot() (*Snapshot, error) {
 	n.mu.Lock()
 	path := n.snapshotPath
-	n.mu.Unlock()
 	if path == "" {
-		return nil, nil
+		defer n.mu.Unlock()
+		if n.snapshotIndex == 0 {
+			return nil, nil
+		}
+		return &Snapshot{n.snapshotIndex, n.snapshotTerm, json.RawMessage(n.snapshotData), n.baseConfig.clone()}, nil
 	}
+	n.mu.Unlock()
+
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
 		return nil, nil
@@ -96,19 +113,8 @@ func (n *Node) writeSnapshot(snap Snapshot) error {
 	if err != nil {
 		return fmt.Errorf("raft: snapshot marshal: %w", err)
 	}
-	tmp := n.snapshotPath + ".tmp"
-	f, err := os.Create(tmp)
-	if err != nil {
-		return fmt.Errorf("raft: snapshot create: %w", err)
+	if err := writeFileAtomic(n.snapshotPath, data); err != nil {
+		return fmt.Errorf("raft: snapshot: %w", err)
 	}
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		return fmt.Errorf("raft: snapshot write: %w", err)
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return fmt.Errorf("raft: snapshot fsync: %w", err)
-	}
-	f.Close()
-	return os.Rename(tmp, n.snapshotPath)
+	return nil
 }
