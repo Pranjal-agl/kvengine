@@ -8,6 +8,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -20,6 +21,8 @@ type snapRecorder struct {
 	sizes []int
 	// fail returns an error to inject for a call, or nil to deliver it.
 	fail func(args InstallSnapshotArgs, nth int) error
+	// onLeader, if set, is told the leader snapshotToLagger picked.
+	onLeader func(*Node)
 }
 
 func (r *snapRecorder) InstallSnapshot(peer string, args InstallSnapshotArgs) (InstallSnapshotReply, error) {
@@ -112,6 +115,9 @@ func snapshotToLagger(t *testing.T, tr *snapRecorder, data []byte) []byte {
 	}
 	if leader == nil {
 		t.Fatal("no leader among a, b")
+	}
+	if tr.onLeader != nil {
+		tr.onLeader(leader)
 	}
 	for _, p := range []string{"a", "b"} {
 		tr.Partition(p, "c")
@@ -363,5 +369,58 @@ func TestTCPTransportCarriesChunks(t *testing.T) {
 	}
 	if snap, _ := n.LatestSnapshot(); snap == nil || !bytes.Equal(snap.Data, data) {
 		t.Fatal("snapshot not installed from chunks")
+	}
+}
+
+// At most one snapshot transfer per peer at a time, including when a
+// transfer finishes while the leader already has a newer snapshot: the
+// install hands off to a new transfer, whose in-flight mark the finished
+// one must not clear (it did, and the next heartbeat started a second,
+// concurrent transfer).
+func TestOneSnapshotTransferPerPeer(t *testing.T) {
+	var inFlight, maxInFlight atomic.Int32
+	var leader atomic.Pointer[Node]
+	var newer sync.Once
+	tr := &snapRecorder{MemTransport: NewMemTransport()}
+	tr.onLeader = func(l *Node) { leader.Store(l) }
+	data := bigSnapshot(3 * snapshotChunkSize)
+	tr.fail = func(args InstallSnapshotArgs, nth int) error {
+		if !args.More {
+			// The first transfer's last chunk: snapshot again, so the
+			// install is followed straight away by a second transfer.
+			newer.Do(func() {
+				l := leader.Load()
+				idx, _, _ := l.Propose([]byte("more"))
+				for l.State().LastApplied < idx {
+					time.Sleep(time.Millisecond)
+				}
+				if err := l.TakeSnapshot(idx, data); err != nil {
+					t.Error(err)
+				}
+			})
+		}
+		cur := inFlight.Add(1)
+		for {
+			m := maxInFlight.Load()
+			if cur <= m || maxInFlight.CompareAndSwap(m, cur) {
+				break
+			}
+		}
+		time.Sleep(40 * time.Millisecond) // slower than a heartbeat
+		inFlight.Add(-1)
+		return nil
+	}
+	snapshotToLagger(t, tr, data)
+	time.Sleep(500 * time.Millisecond) // let the second transfer run
+	calls, _ := tr.log()
+	indexes := map[uint64]bool{}
+	for _, c := range calls {
+		indexes[c.LastIncludedIndex] = true
+	}
+	if len(indexes) < 2 {
+		t.Fatalf("only %d snapshot(s) sent; the test needs a second transfer", len(indexes))
+	}
+	if m := maxInFlight.Load(); m > 1 {
+		t.Fatalf("%d InstallSnapshot RPCs in flight to one peer at once", m)
 	}
 }

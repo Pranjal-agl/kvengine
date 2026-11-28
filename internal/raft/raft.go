@@ -726,8 +726,12 @@ func (n *Node) transferSnapshot(peer string, term uint64, snap Snapshot, offset 
 	whole := len(snap.Data) <= snapshotChunkSize
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	handedOff := false
 	defer func() {
-		if n.currentTerm == term && n.snapshotInFlight != nil {
+		// Clear the in-flight mark on every exit except a hand-off: after an
+		// install, sendAppendEntries may already have started the next
+		// transfer (a newer snapshot), and its mark must stay.
+		if !handedOff && n.currentTerm == term && n.snapshotInFlight != nil {
 			n.snapshotInFlight[peer] = false
 		}
 	}()
@@ -804,6 +808,7 @@ func (n *Node) transferSnapshot(peer string, term uint64, snap Snapshot, offset 
 			n.signal()
 		}
 		n.snapshotInFlight[peer] = false
+		handedOff = true
 		n.sendAppendEntries(peer) // follow up with any entries after the snapshot
 		return
 	}
