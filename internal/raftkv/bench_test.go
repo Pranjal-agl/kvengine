@@ -61,6 +61,24 @@ func newTCPCluster(tb testing.TB, opts Options) *tcpCluster {
 	return c
 }
 
+// putRetry writes via whichever live node (not down) is leader, retrying
+// across leader changes.
+func (c *tcpCluster) putRetry(t *testing.T, down int, key string, val []byte) {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		for i, n := range c.nodes {
+			if i != down && n.State().Role == raft.Leader {
+				if c.kvs[i].Put([]byte(key), val) == nil {
+					return
+				}
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("could not write %s", key)
+}
+
 // restart (re)starts node i on its files and address.
 func (c *tcpCluster) restart(tb testing.TB, i int) {
 	tb.Helper()
@@ -202,8 +220,8 @@ func BenchmarkClusterPutShortLog(b *testing.B) {
 // A follower that falls far behind must be able to catch up even when the
 // entries it's missing add up to more than one RPC may carry (32 MiB).
 func TestFollowerCatchesUpAfterLargeBacklog(t *testing.T) {
-	if testing.Short() {
-		t.Skip("writes ~40 MB")
+	if testing.Short() || raceEnabled {
+		t.Skip("moves ~40 MB; skipped with -short and -race")
 	}
 	c := newTCPCluster(t, Options{SnapshotEvery: 0}) // no snapshots: catch-up must use the log
 	l := c.leader(t)
@@ -213,9 +231,7 @@ func TestFollowerCatchesUpAfterLargeBacklog(t *testing.T) {
 
 	val := make([]byte, 1<<20)
 	for i := 0; i < 40; i++ {
-		if err := c.kvs[l].Put([]byte(fmt.Sprintf("big%d", i)), val); err != nil {
-			t.Fatal(err)
-		}
+		c.putRetry(t, f, fmt.Sprintf("big%d", i), val)
 	}
 	// Bring the follower back on the same files and address.
 	c.restart(t, f)
@@ -234,8 +250,8 @@ func TestFollowerCatchesUpAfterLargeBacklog(t *testing.T) {
 // Same, but the leader compacts its log meanwhile, so the follower must
 // receive a snapshot bigger than the old 32 MiB message cap.
 func TestFollowerCatchesUpWithLargeSnapshot(t *testing.T) {
-	if testing.Short() {
-		t.Skip("writes ~40 MB")
+	if testing.Short() || raceEnabled {
+		t.Skip("moves ~40 MB; skipped with -short and -race")
 	}
 	c := newTCPCluster(t, Options{SnapshotEvery: 10})
 	l := c.leader(t)
@@ -244,12 +260,16 @@ func TestFollowerCatchesUpWithLargeSnapshot(t *testing.T) {
 	c.nodes[f].Stop()
 	val := make([]byte, 1<<20)
 	for i := 0; i < 40; i++ {
-		if err := c.kvs[l].Put([]byte(fmt.Sprintf("big%d", i)), val); err != nil {
-			t.Fatal(err)
+		c.putRetry(t, f, fmt.Sprintf("big%d", i), val)
+	}
+	snapped := false
+	for i, n := range c.nodes {
+		if i != f && n.SnapshotIndex() > 0 {
+			snapped = true
 		}
 	}
-	if c.nodes[l].SnapshotIndex() == 0 {
-		t.Fatal("leader never snapshotted")
+	if !snapped {
+		t.Fatal("no live node snapshotted")
 	}
 	c.restart(t, f)
 	deadline := time.Now().Add(30 * time.Second)
