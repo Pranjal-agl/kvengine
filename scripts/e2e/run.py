@@ -278,6 +278,59 @@ def membership(binary, old):
     c.cleanup()
 
 
+def _write_gap(c, victim, action):
+    """Runs action() (which takes victim's leadership away) and returns how
+    long until another node accepts a write."""
+    others = [n for n in c.live() if n is not victim]
+    t0 = time.monotonic()
+    action()
+    while time.monotonic() - t0 < 10:
+        for n in others:
+            try:
+                with n.client(timeout=1) as cl:
+                    cl.put("probe", "x")
+                return time.monotonic() - t0
+            except (OSError, KVError, ConnectionError):
+                pass
+        time.sleep(0.002)
+    raise AssertionError("no node accepted a write within 10s")
+
+
+@scenario()
+def leader_handoff(binary, old):
+    """TRANSFER moves leadership; a SIGTERMed leader hands over before
+    exiting, so writes resume in milliseconds rather than after an election
+    timeout (200-400 ms, plus detection)."""
+    c = Cluster(binary, ["n0", "n1", "n2"])
+    try:
+        c.start_all()
+        c.put("a", "1")
+        old_leader = c.leader()
+        target = next(n for n in c.live() if n is not old_leader)
+        t0 = time.monotonic()
+        with old_leader.client() as cl:
+            cl.admin("TRANSFER", target.id)
+        took = time.monotonic() - t0
+        print("    TRANSFER %s -> %s took %.1f ms" % (old_leader.id, target.id, took * 1000))
+        # ~5 ms on loopback; it was ~50 ms (one heartbeat) when the old
+        # leader didn't wake the transfer on learning of the new leader.
+        assert took < 0.04, "TRANSFER took %.0f ms" % (took * 1000)
+        assert c.leader().id == target.id
+        expect_value(old_leader, "a", b"1")
+
+        victim = c.leader()
+        gap = _write_gap(c, victim, lambda: victim.stop())
+        print("    writes resumed %.1f ms after SIGTERM to leader %s" % (gap * 1000, victim.id))
+        # ~8 ms with the hand-off; 300-440 ms without (an election timeout).
+        assert gap < 0.1, "write gap %.0f ms after SIGTERM; the leader should hand over first" % (gap * 1000)
+        with open(os.path.join(c.root, victim.id + ".log"), "rb") as f:
+            assert b"handed leadership over" in f.read()
+    except BaseException:
+        c.cleanup(failed=True)
+        raise
+    c.cleanup()
+
+
 @scenario()
 def add_unreachable(binary, old):
     """ADDNODE for a node that never answers fails after --catch-up-timeout

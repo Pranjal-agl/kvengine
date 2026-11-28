@@ -164,6 +164,19 @@ func (t *SimTransport) InstallSnapshot(peer string, args InstallSnapshotArgs) (I
 	return node.HandleInstallSnapshot(args), nil
 }
 
+func (t *SimTransport) TimeoutNow(peer string, args TimeoutNowArgs) (TimeoutNowReply, error) {
+	dropped := t.shouldDrop(args.LeaderId, peer)
+	t.record(args.LeaderId, peer, "TimeoutNow", dropped)
+	if dropped {
+		return TimeoutNowReply{}, fmt.Errorf("sim: dropped TimeoutNow %s→%s", args.LeaderId, peer)
+	}
+	node, ok := t.getNode(peer)
+	if !ok {
+		return TimeoutNowReply{}, fmt.Errorf("sim: unknown peer %s", peer)
+	}
+	return node.HandleTimeoutNow(args), nil
+}
+
 func (t *SimTransport) ReadIndex(peer string, args ReadIndexArgs) (ReadIndexReply, error) {
 	dropped := t.shouldDrop(args.From, peer)
 	t.record(args.From, peer, "ReadIndex", dropped)

@@ -422,6 +422,19 @@ func (kv *KV) changeMembership(propose func() (uint64, uint64, error)) error {
 	}
 }
 
+// TransferLeader hands leadership to member id (or, if id is "", to the
+// most up-to-date other member) and returns once it has taken over. The
+// node must be the leader. Writes are refused (NotLeaderError) for the
+// round trip or so the transfer takes.
+func (kv *KV) TransferLeader(id string) error {
+	err := kv.node.TransferLeadership(id, kv.opts.WriteTimeout)
+	var nle *raft.NotLeaderError
+	if errors.As(err, &nle) {
+		return &NotLeaderError{LeaderID: nle.LeaderId}
+	}
+	return err
+}
+
 // MembersInfo describes the current membership, one "id addr" line per
 // member with the leader marked, for the MEMBERS command.
 func (kv *KV) MembersInfo() string {

@@ -96,13 +96,14 @@ func chaosRun(t *testing.T, seed int64) {
 		}
 	}
 
+	transfers := 0
 	deadline := time.Now().Add(4 * time.Second)
 	for time.Now().Before(deadline) {
 		// Pace the chaos so nodes live long enough to hold elections
 		// (timeouts are 200-400ms); otherwise nothing ever commits and
 		// the safety checks pass vacuously.
 		time.Sleep(time.Duration(10+r.Intn(30)) * time.Millisecond)
-		switch r.Intn(10) {
+		switch r.Intn(11) {
 		case 0, 1, 2, 3:
 			tryPropose()
 		case 4: // partition a random pair
@@ -140,6 +141,20 @@ func chaosRun(t *testing.T, seed int64) {
 			if !down[id] && len(down) < 2 {
 				c.stop(id)
 				down[id] = true
+			}
+		case 10: // hand leadership to a random member
+			c.mu.Lock()
+			var l *Node
+			for id, n := range c.nodes {
+				if !down[id] && n.State().Role == Leader {
+					l = n
+				}
+			}
+			c.mu.Unlock()
+			if l != nil {
+				ids := l.Members().IDs()
+				l.TransferLeadership(ids[r.Intn(len(ids))], 300*time.Millisecond)
+				transfers++
 			}
 		case 9: // restart a crashed node from its files
 			for id := range down {
@@ -211,8 +226,8 @@ func chaosRun(t *testing.T, seed int64) {
 			}
 		}
 	}
-	t.Logf("%d commits (%d under chaos), %d nodes ever, final leader members %v",
-		committed, duringChaos, len(c.applied), func() string {
+	t.Logf("%d commits (%d under chaos), %d nodes ever, %d transfers attempted, final leader members %v",
+		committed, duringChaos, len(c.applied), transfers, func() string {
 			for _, n := range c.nodes {
 				if n.State().Role == Leader {
 					return n.Members().String()

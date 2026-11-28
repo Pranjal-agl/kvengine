@@ -106,6 +106,10 @@ type RequestVoteArgs struct {
 	CandidateId  string
 	LastLogIndex uint64
 	LastLogTerm  uint64
+	// Transfer: this election was asked for by the leader (TimeoutNow, a
+	// leadership transfer), so voters must not ignore it as disruptive
+	// while they still hear from that leader. Voting rules are unchanged.
+	Transfer bool
 }
 type RequestVoteReply struct {
 	Term        uint64
@@ -234,6 +238,9 @@ type Node struct {
 	// learners: servers AddServer is catching up before they become
 	// members. They get the log but count toward no majority.
 	learners map[string]bool
+	// transferTo: target of a leadership transfer in progress (transfer.go);
+	// while set, the leader accepts no proposals or membership changes.
+	transferTo string
 
 	// ReadIndex support. Every AppendEntries/InstallSnapshot carries the
 	// value of hbRound when it was built; ackRound[peer] is the highest
@@ -434,7 +441,7 @@ func (n *Node) electionLoop() {
 
 		n.mu.Lock()
 		if !n.stopped() && n.role != Leader && n.isMember(n.id) && time.Since(n.lastHeartbeat) >= timeout {
-			n.startElection() // called with mu held
+			n.startElection(false) // called with mu held
 		}
 		n.mu.Unlock()
 	}
@@ -442,8 +449,9 @@ func (n *Node) electionLoop() {
 
 // startElection transitions us to Candidate, increments the term, votes
 // for ourself, and sends RequestVote to all peers in separate goroutines.
+// transfer marks an election the leader asked for (TimeoutNow).
 // Called with n.mu held; stays locked on return.
-func (n *Node) startElection() {
+func (n *Node) startElection(transfer bool) {
 	n.currentTerm++
 	n.role = Candidate
 	n.votedFor = n.id
@@ -470,6 +478,7 @@ func (n *Node) startElection() {
 				CandidateId:  n.id,
 				LastLogIndex: lastIdx,
 				LastLogTerm:  lastTerm,
+				Transfer:     transfer,
 			})
 			if err != nil {
 				return
@@ -531,6 +540,7 @@ func (n *Node) becomeLeader() {
 	n.ackRound = make(map[string]uint64, len(n.peers))
 	n.lastAck = make(map[string]time.Time, len(n.peers))
 	n.learners = map[string]bool{}
+	n.transferTo = ""
 	n.leaderSince = time.Now()
 	n.readRoundOn, n.readsQueued = false, false
 	n.signal()
@@ -656,8 +666,8 @@ func (n *Node) sendAppendEntries(peer string) {
 			}
 			n.nextIndex[peer] = n.matchIndex[peer] + 1
 			n.maybeAdvanceCommitIndex()
-			if n.learners[peer] {
-				n.signal() // AddServer is watching its progress
+			if n.learners[peer] || peer == n.transferTo {
+				n.signal() // AddServer or TransferLeadership is watching its progress
 			}
 			return
 		}
@@ -913,7 +923,9 @@ func (n *Node) HandleRequestVote(args RequestVoteArgs) RequestVoteReply {
 	// entirely (don't even adopt their term). Otherwise a server removed
 	// from the cluster, which no longer gets heartbeats, would keep timing
 	// out and forcing pointless elections with ever-higher terms.
-	if args.Term > n.currentTerm && n.leaderAlive() {
+	// A transfer election was asked for by the leader itself, so it isn't
+	// disruptive; it still has to win votes under the usual rules.
+	if args.Term > n.currentTerm && n.leaderAlive() && !args.Transfer {
 		return RequestVoteReply{Term: n.currentTerm, VoteGranted: false}
 	}
 	if args.Term > n.currentTerm {
@@ -950,7 +962,10 @@ func (n *Node) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 		return AppendEntriesReply{Term: n.currentTerm, Success: false}
 	}
 	n.becomeFollower(args.Term) // also steps down a same-term candidate
-	n.leaderId = args.LeaderId
+	if n.leaderId != args.LeaderId {
+		n.leaderId = args.LeaderId
+		n.signal() // wake TransferLeadership, which waits to see the new leader
+	}
 	n.lastHeartbeat = time.Now() // valid message from current leader
 	n.lastLeaderContact = n.lastHeartbeat
 
@@ -1143,7 +1158,9 @@ func (n *Node) Propose(command []byte) (uint64, uint64, bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	if n.role != Leader || n.stopped() {
+	if n.role != Leader || n.stopped() || n.transferTo != "" {
+		// (During a leadership transfer the log must stop growing so the
+		// target can catch up; callers retry, normally on the new leader.)
 		return 0, n.currentTerm, false
 	}
 	n.log = append(n.log, LogEntry{Term: n.currentTerm, Command: command})
