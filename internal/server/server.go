@@ -252,20 +252,23 @@ func readLine(r *bufio.Reader, maxSize int) ([]byte, error) {
 }
 
 // handlePut implements: PUT <key> <valueLen>\r\n<valueLen bytes>\r\n
-// Returns fatal=true if a framing error occurred that desyncs the byte
-// stream (e.g. a bad length means we don't know how many bytes to skip to
-// resync) — in that case the connection must be closed rather than
+// Returns fatal=true if the request is malformed: the byte stream can no
+// longer be framed reliably, so the connection must be closed rather than
 // continuing, since further reads would be misinterpreted.
 func (srv *Server) handlePut(conn net.Conn, r *bufio.Reader, w *bufio.Writer, fields []string) (fatal bool) {
+	// Any malformed PUT is fatal for the connection. The client has very
+	// likely sent value bytes after the line, and without a valid length
+	// there is no way to skip them: carrying on would execute them as
+	// commands (a value of "DEL k" would delete k).
 	if len(fields) != 3 {
 		writeErr(w, fmt.Errorf("PUT requires <key> <valueLen>, got %d args", len(fields)-1))
-		return false // safe to continue: no value bytes were promised on the wire
+		return true
 	}
 	key := fields[1]
 	n, err := strconv.Atoi(fields[2])
 	if err != nil || n < 0 {
 		writeErr(w, fmt.Errorf("invalid value length %q", fields[2]))
-		return false
+		return true
 	}
 	if n > maxValueSize {
 		writeErr(w, fmt.Errorf("value length %d exceeds max %d", n, maxValueSize))

@@ -447,3 +447,40 @@ func TestAdminCommandsWithoutRaft(t *testing.T) {
 		t.Fatalf("got %q", line)
 	}
 }
+
+// A PUT with a malformed length leaves the server unable to tell where the
+// value ends, so it must not keep parsing: the client has almost certainly
+// sent the value anyway, and reading it as commands would let a value of
+// "DEL victim" delete a key.
+func TestMalformedPutCannotInjectCommands(t *testing.T) {
+	for _, bad := range []string{"PUT k abc\r\n", "PUT k -5\r\n", "PUT k\r\n", "PUT k 5 extra\r\n"} {
+		srv, addr := startTestServer(t)
+		_ = srv
+		set, _ := net.Dial("tcp", addr)
+		fmt.Fprint(set, "PUT victim 1\r\nx\r\n")
+		bufio.NewReader(set).ReadString('\n')
+		set.Close()
+
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fmt.Fprint(conn, bad+"DEL victim\r\n\r\n")
+		r := bufio.NewReader(conn)
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		first, _ := r.ReadString('\n')
+		rest, _ := r.ReadString('\n')
+		conn.Close()
+		if first[:4] != "-ERR" || rest != "" {
+			t.Fatalf("%q: got %q then %q; want -ERR and the connection closed", bad, first, rest)
+		}
+
+		check, _ := net.Dial("tcp", addr)
+		fmt.Fprint(check, "GET victim\r\n")
+		line, _ := bufio.NewReader(check).ReadString('\n')
+		check.Close()
+		if line != "$1\r\n" {
+			t.Fatalf("%q: value bytes were executed as a command (GET victim -> %q)", bad, line)
+		}
+	}
+}
