@@ -30,6 +30,28 @@ jobs:
       - name: raft tests, repeated (catch timing flakes)
         run: go test -race -count=3 -timeout 10m ./internal/raft/... ./internal/raftkv/...
 
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the migration test builds the v1.0 release from history
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: end-to-end scenarios (real processes)
+        run: bash scripts/e2e/run.sh
+      - name: upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-logs
+          path: /tmp/kvengine-e2e-*
+          if-no-files-found: ignore
+
   fuzz:
     runs-on: ubuntu-latest
     steps:

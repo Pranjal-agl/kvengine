@@ -187,6 +187,29 @@ go test -race -v ./internal/linearcheck/...
 
 ---
 
+## End-to-end: real processes
+
+```bash
+make e2e                                  # all scenarios (~25 s)
+bash scripts/e2e/run.sh failover membership   # some of them
+```
+
+`scripts/e2e/run.sh` builds `kvengine`, builds the v1.0 release from git history (commit `47f1503`; set `KVENGINE_OLD_REF=none` to skip), and runs `scripts/e2e/run.py`, which starts real nodes on free localhost ports and drives them over the client protocol. It needs Python 3.8+ and nothing else. CI runs it on every push. Failed scenarios keep their logs and data directories under `/tmp/kvengine-e2e-*`.
+
+| Scenario | What it checks |
+|---|---|
+| `failover` | SIGKILL the leader: a new one is elected (~0.5 s), no acknowledged write is lost, followers reject writes and name the leader, the old leader catches up when restarted |
+| `binary_values` | CRLF, NUL, high bytes, empty and 256 KB values survive Raft, snapshots and a full restart |
+| `snapshot_catchup` | A node down for 300 writes (snapshots every 10) catches up via InstallSnapshot |
+| `clean_shutdown` | SIGINT and SIGTERM exit 0 promptly and log `shutdown complete`; data is intact afterwards |
+| `follower_reads` | Linearizable follower reads see each write acknowledged just before them; with the leader frozen (SIGSTOP) they fail within the read timeout, while `--stale-reads` still answers |
+| `membership` | `--join` + `ADDNODE`, kill the leader, `REMOVENODE` it, add another node, then restart every node with no `--peers` at all (membership comes from disk) |
+| `crash_under_load` | SIGKILL all three nodes during an 8-writer load; after restart every acknowledged write is present |
+| `single_node` | Single-node CLI and server mode across restarts |
+| `migrate` | A cluster written by v1.0 is stopped and restarted on the new binary with its data, including keys like `user` that are valid base64 |
+
+---
+
 ## Manual testing: single node
 
 ```bash

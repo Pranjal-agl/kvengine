@@ -40,6 +40,7 @@ internal/
   linearcheck/             Linearizability checker (Wing-Gong search, per-key + memoised)
 test/fault_injection/      SIGKILL-based crash durability harness
 scripts/                   flamegraph.sh, fuzz.sh
+scripts/e2e/               End-to-end scenarios against real kvengine processes
 docs/                      ARCHITECTURE.md, BENCHMARKS.md, TESTING.md
 ```
 
@@ -109,6 +110,7 @@ make fuzz-seeds          # run fuzz seed corpus (fast)
 make fuzz FUZZ_SECS=60   # run all fuzz targets for 60s each
 make bench               # store, server, and LSM benchmarks
 make flamegraph          # CPU flamegraph under load -> profiles/cpu.svg
+make e2e                 # real processes: failover, membership, crashes, v1.0 migration
 ```
 
 ### What each test actually proves
@@ -140,6 +142,7 @@ make flamegraph          # CPU flamegraph under load -> profiles/cpu.svg
 | `internal/lsm` | `TestConcurrentSameKeyMemoryMatchesRecovery`, `TestBloomNoFalseNegativesAndLowFPRate` | LSM group commit keeps memory and WAL in the same order; bloom filters never miss a present key, ~0.8% false positives |
 | `internal/raft` | `TestSnapshotNewerThanLogFile`, `TestTruncationSurvivesRestart` | The append-only Raft log recovers from a crash between snapshot and log rewrite; follower truncations are durable |
 | `internal/linearcheck` | `TestConcurrentStoreLinearizable`, `TestCheckNotLinearizable` | 48 concurrent ops on a real store are linearizable; violations are detected |
+| `scripts/e2e` | `failover`, `membership`, `crash_under_load`, `migrate` | Real processes: SIGKILLed leaders are replaced and caught up; nodes join and leave; SIGKILL of the whole cluster under load loses no acknowledged write; v1.0 data survives an upgrade |
 | `internal/linearcheck` | `TestCheckScalesToLargeHistories` | The checker handles 3,000-op histories in well under a second (per-key decomposition + memoisation) |
 
 ---
@@ -194,6 +197,7 @@ Keys are whitespace-delimited text. Values are length-prefixed binary, so arbitr
 - **No leadership transfer**, and a membership change doesn't first catch up a new node as a non-voting learner. Adding a node that is far behind briefly makes commits wait for a majority that includes it.
 - **LSM compaction runs inline** on the write that triggers it, so that write (and those queued behind it) waits for the compaction. Production engines compact in the background.
 - **The WAL store can't compact while replicating** (legacy leader/follower mode streams the log by byte offset).
+- **Upgrading from v1.0 must be done offline.** Stop every node, then start them all on the new binary: the data (v1.0's Raft log and snapshots) is read back. A rolling upgrade isn't supported, because v1.0 nodes misread log entries written by newer leaders (newer releases store keys and values as base64, which v1.0 would apply literally). v1.0 also has the safety bugs fixed since, so it shouldn't share a cluster with anything.
 - **Keys can't contain whitespace** in the text protocol (values are binary-safe).
 - **Crash tests kill processes, not machines.** SIGKILL tests cover process crashes; power loss also depends on the fsync and rename ordering being honored by the OS and disk, which the code follows but these tests can't simulate.
 

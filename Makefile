@@ -1,4 +1,4 @@
-.PHONY: build test test-race test-short bench fuzz flamegraph fmt vet clean
+.PHONY: build test test-race test-short bench fuzz flamegraph e2e fmt vet clean
 
 build:
 	go build ./...
@@ -31,6 +31,10 @@ fuzz-seeds:
 flamegraph:
 	chmod +x scripts/flamegraph.sh
 	./scripts/flamegraph.sh
+
+# End-to-end scenarios against real processes (needs python3; builds v1.0 from git history for the migration test)
+e2e:
+	bash scripts/e2e/run.sh
 
 fmt:
 	gofmt -l -w .
