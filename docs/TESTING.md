@@ -68,6 +68,7 @@ go test -race -v ./internal/store/...
 - `TestConcurrentSameKeyMemoryMatchesLog`: memory state before a restart must equal WAL replay after it, under concurrent writes to the same keys
 - `TestWritesAfterTornTailSurviveSecondRestart`: crash with a torn tail, restart, write, restart again; every acknowledged write must survive
 - `TestRestoreSnapshotReplacesState`, `TestSnapshotBinarySafe`: snapshots replace (not merge) state and round-trip binary keys/values
+- `TestCompactShrinksWALAndKeepsData`, `TestAutoCompaction`, `TestCompactionOffWhileReplicating`, `TestInterruptedCompactionLeftover`, `TestConcurrentWritesDuringCompaction`: WAL compaction
 
 ### test/fault_injection
 
@@ -76,6 +77,8 @@ go test -v ./test/fault_injection/...
 ```
 
 This one takes about 30 seconds. It spawns a real subprocess, writes records in a loop with fsync after each, kills it with SIGKILL at a random point, and verifies no confirmed write was lost. Runs 15 times with different kill timing.
+
+`TestStoreCompactionFaultInjection` does the same against the WAL store while it compacts its log every few dozen writes, so kills land mid-rewrite and around the rename.
 
 `TestLSMFaultInjection` does the same against the LSM engine, with a 2 KB MemTable so the writer is constantly flushing and compacting when the kill lands. The recovered state must match the model after exactly the acknowledged operations (or one more, if the in-flight operation reached the WAL).
 
@@ -126,6 +129,11 @@ go test -race -v -timeout 60s ./internal/raft/...
 - `TestSnapshotNewerThanLogFile`: crash between writing a snapshot and rewriting the log, in both the agreeing and conflicting cases
 - `TestLegacyStateFileMigrates`, `TestSnapshotCompactsLogFile`, `TestSingleNodeOnDiskCommitsAfterFsync`: format migration, log compaction on disk, and commit via the batched leader fsync
 - `TestTCPTransportReusesConnections`, `TestTCPTransportRetriesStaleConnection`, `TestTCPTransportCloseStopsExistingConnections`: connection pooling, transparent retry after a peer restart, and a closed transport going silent
+- `TestAddServer`, `TestRemoveFollower`, `TestRemoveLeader`, `TestOneMembershipChangeAtATime`: membership changes, including that a removed node can't disrupt the cluster and a removed leader steps down only once its removal commits
+- `TestUncommittedConfigRevertsOnTruncation`, `TestMembershipSurvivesSnapshotsAndRestart`, `TestRequestVoteIgnoredWhileLeaderAlive`, `TestEvenSplitHasNoQuorum`, `TestReadIndexSkipsConfigEntries`
+- `TestLeaderWithoutQuorumStepsDown`: a leader that reaches only a minority steps down (CheckQuorum) so the majority can elect a new one
+- `TestMembershipChaos`: random membership changes, partitions, crashes and restarts under load; Election Safety checked continuously, State Machine Safety at the end
+- `TestCodecRoundTrip`, `TestCodecRejectsTruncationAndTrailingBytes`, `FuzzDecodeRPC`, `TestTCPTransportAnswersLegacyJSON`, `TestTCPTransportFallsBackToJSONForOldPeers`: the binary codec and rolling-upgrade compatibility
 
 ### internal/raftkv
 
@@ -143,6 +151,8 @@ go test -race -v ./internal/raftkv/...
 - `TestFollowerReadsSeeAcknowledgedWrites`: a follower read issued right after a write is acknowledged returns that write
 - `TestDeposedLeaderCannotServeStaleRead`: a partitioned ex-leader (whose local state is stale) refuses linearizable reads
 - `TestFollowerReadWithNoQuorum`: with no quorum, follower reads fail promptly instead of hanging or going stale
+- `TestAddAndRemoveNode`: a joining node catches up on earlier data; removing the leader hands off cleanly
+- `TestFollowerCatchesUpAfterLargeBacklog`, `TestFollowerCatchesUpWithLargeSnapshot`: a follower 40 MB behind catches up through capped AppendEntries batches or a >32 MiB snapshot (skipped under -race, which slows big copies ~10x)
 
 ### internal/lsm
 
@@ -159,6 +169,8 @@ go test -race -v ./internal/lsm/...
 - `TestWALFilesDoNotAccumulate`, `TestNoSyncSurvivesProcessCrash`, `TestConcurrentReadWriteWithFlushes`
 - `TestConcurrentSameKeyMemoryMatchesRecovery`: under group commit, 16 writers on 3 hot keys; memory before a crash must equal WAL replay after it
 - `TestBloomNoFalseNegativesAndLowFPRate`, `TestBloomSkipsTablesOnMiss`: no false negatives, ~0.8% false positives, misses skip tables, tombstones still found
+- `TestLeveledCompactionInvariants`, `TestTombstoneKeptUntilNothingOlderBelow`, `TestLSMMatchesModel`: levels stay sorted, disjoint and within budget; tombstones aren't dropped while older data remains below; random ops with crashes and reopens agree with a map
+- `TestOrphanSSTableIgnored`, `TestTornManifestTail`, `TestPreManifestDirectoryMigrates`: manifest recovery
 - `TestCompaction`: merges L0 into L1 correctly; updated keys show the new value, deleted keys are gone
 - `TestSSTableFileCountBounded`: after 20 rounds of writes and flushes, total SSTable file count stays bounded
 

@@ -204,6 +204,11 @@ type Node struct {
 	hbRound  uint64
 	ackRound map[string]uint64
 
+	// CheckQuorum: when each member last answered us as leader, and when we
+	// became leader. See checkQuorum.
+	lastAck     map[string]time.Time
+	leaderSince time.Time
+
 	// Read batching: at most one read-confirmation round is in flight.
 	// Reads arriving meanwhile are assigned the next round, which starts
 	// as soon as the in-flight one reaches a quorum, so N concurrent reads
@@ -484,6 +489,8 @@ func (n *Node) becomeLeader() {
 	n.matchIndex = make(map[string]uint64, len(n.peers))
 	n.snapshotInFlight = make(map[string]bool, len(n.peers))
 	n.ackRound = make(map[string]uint64, len(n.peers))
+	n.lastAck = make(map[string]time.Time, len(n.peers))
+	n.leaderSince = time.Now()
 	n.readRoundOn, n.readsQueued = false, false
 	n.signal()
 	for _, peer := range n.peers {
@@ -514,6 +521,9 @@ func (n *Node) heartbeatLoop() {
 			return
 		case <-ticker.C:
 			n.mu.Lock()
+			if !n.stopped() && n.role == Leader {
+				n.checkQuorum()
+			}
 			if !n.stopped() && n.role == Leader {
 				n.broadcastAppendEntries()
 			}
@@ -738,7 +748,32 @@ func (n *Node) signal() {
 	n.changed = make(chan struct{})
 }
 
+// checkQuorum steps a leader down if a majority of the configuration
+// hasn't answered it within the maximum election timeout (etcd's
+// CheckQuorum). This is the necessary partner of ignoring RequestVote
+// while a leader is alive (§4.2.3): without it, a leader cut off from the
+// majority but still reaching a few followers keeps those followers
+// ignoring candidates, and no one else can gather a majority — the
+// cluster stalls until the partition heals (TestLeaderWithoutQuorumStepsDown).
+// Stepping down doesn't change the term; it just frees the followers to
+// vote. Called with mu held.
+func (n *Node) checkQuorum() {
+	now := time.Now()
+	if now.Sub(n.leaderSince) < electionTimeoutMax {
+		return // grace period: peers haven't had a chance to answer yet
+	}
+	active := n.hasQuorum(func(id string) bool {
+		return id == n.id || now.Sub(n.lastAck[id]) < electionTimeoutMax
+	})
+	if !active {
+		n.role = Follower
+		n.leaderId = ""
+		n.signal()
+	}
+}
+
 func (n *Node) recordAck(peer string, round uint64) {
+	n.lastAck[peer] = time.Now()
 	if round > n.ackRound[peer] {
 		n.ackRound[peer] = round
 		n.advanceReadRound()

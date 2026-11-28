@@ -44,6 +44,12 @@ What this does not handle yet:
 - Mid-file corruption (not just a torn tail). If a record in the middle of the file is corrupt, recovery stops there and everything after it is moved to the `.corrupt-<offset>` side file rather than replayed. The bytes are preserved for inspection, but the records are not recovered automatically.
 - No whole-file checksum. We rely on fsync semantics being honored by the OS and filesystem, which holds on Linux with default mount options.
 
+### Log compaction
+
+The log would otherwise grow with every write, even when the same key is overwritten again and again. `Compact()` rewrites it to contain only the live data, one Put per key. It also runs automatically once the log is over `CompactMinBytes` (64 MiB) *and* `CompactRatio` (4×) times the live size. Live size is tracked incrementally as records are applied. Compaction runs as the group-commit leader, so no write can land between taking the snapshot and swapping in the new log, while reads continue. The new log is fsynced before it is atomically renamed over the old one, and an interrupted compaction's temp file is removed on open, so a crash at any point leaves exactly one complete log. `TestStoreCompactionFaultInjection` SIGKILLs a writer that compacts every few dozen writes: all trials recover exactly, with the log bounded at about 15 KB over 2,000 writes.
+
+Compaction is turned off once the log has been handed to the legacy replication leader (`WAL()`), because followers resume by byte offset into the file.
+
 ### fsync policy
 
 Every Put and Delete is fsynced before it returns, so every acknowledged write is durable. Concurrent writers share fsyncs through group commit (next section), so the cost is one fsync per *batch*, not per write.
@@ -98,6 +104,8 @@ DEL <key>\r\n                              ->  +OK\r\n
 ```
 
 Command lines are text and space-delimited. Values are length-prefixed binary so arbitrary byte content works without escaping.
+
+A malformed PUT (missing, extra, negative or non-numeric length) closes the connection. The client has almost certainly sent the value anyway, and without a valid length the server can't skip it. An earlier version replied `-ERR` and kept going, so the value bytes were parsed as the next command: a value of `DEL victim` deleted `victim` (`TestMalformedPutCannotInjectCommands`).
 
 ### Partial read handling
 
@@ -206,6 +214,29 @@ The snapshot file and the state file are written separately, snapshot first. The
 - **State** is an in-memory store. The Raft log plus snapshots are the durable copy, so on boot the state machine is restored from the latest snapshot and the log is replayed from there. A separate WAL would only add a second fsync per write and a file that never shrinks.
 - **Encoding**: commands are JSON with `[]byte` fields (base64), and store snapshots are a list of base64 key/value pairs. Plain JSON strings would replace invalid UTF-8 with U+FFFD and silently corrupt binary keys and values.
 
+### Membership changes
+
+Servers join and leave one at a time (thesis §4.1, `internal/raft/membership.go`). A configuration maps each member ID to its transport address. A change is an ordinary log entry (`Kind == EntryConfig`) carrying the complete new configuration. Each server uses the latest configuration in its log *as soon as it is appended*, committed or not, and falls back to an earlier one if that entry is truncated. Elections, commit counting and ReadIndex all count majorities of the current configuration. The configuration as of a snapshot point is stored in the snapshot and sent with InstallSnapshot, so a node that joins after the change was compacted away still learns it.
+
+Single-server changes are safe because any majority of the old configuration overlaps any majority of the new one. The rules that keep them safe, each with a test that fails when the rule is removed:
+
+- **One change at a time.** A new change is refused until the previous config entry has committed.
+- **Commit in the current term first.** A leader must have committed an entry in its term before proposing a change. This fixes the bug in the original single-server algorithm described on raft-dev in 2015; the election no-op makes it cheap.
+- **A removed leader** keeps leading until its removal commits, without counting itself toward majorities, then steps down (§4.2.2).
+- **No disruption** (§4.2.3). A server that has heard from a leader within the minimum election timeout ignores RequestVote entirely, without even adopting the candidate's term. A removed server stops getting heartbeats, so it keeps timing out and campaigning with ever-higher terms; this rule makes the cluster ignore it. In the chaos test's final dump, removed nodes sat at terms 31–32 while the real cluster stayed at term 16.
+- **CheckQuorum.** A leader that hasn't heard from a majority within the maximum election timeout steps down, without changing the term. Ignoring RequestVotes (the previous rule) depends on this. Otherwise a leader cut off from the majority, but still reaching a few followers, keeps those followers ignoring candidates, and no one can gather a majority. In a 4-node cluster where the leader reaches only one node, nothing committed until the partition healed. The chaos test exposed this under CPU contention, by sometimes committing nothing at all, and `TestLeaderWithoutQuorumStepsDown` reproduces it deterministically.
+- **Non-members never campaign.** That is also how a new node waits: `--join` starts it with an empty configuration, and it stays passive until a leader adds it and replicates the configuration to it.
+
+`TestMembershipChaos` runs random adds, removes, partitions, crashes and restarts (with state on disk) under a stream of proposals. A monitor samples every node's role and term for two leaders in one term, and at the end every node's applied sequence is checked against the others. Writing it surfaced two lessons about the test itself. First, unpaced chaos (thousands of crashes a second) committed nothing, so the safety checks passed vacuously; it now asserts progress. Second, random chaos almost never produces an exact 2/2 split, so it missed an injected "a tie counts as a majority" bug. `TestEvenSplitHasNoQuorum` covers that case directly.
+
+It also found a real bug: after a membership change, the newest committed entry is a config entry, which (like a no-op) is never delivered on `applyCh`, so the read index pointed at an index the state machine could never reach. Every linearizable read hung until the next write. `LogEntry.delivered()` is now the single definition used by both `applyLoop` and ReadIndex.
+
+### Wire encoding
+
+RPCs between nodes use a hand-written binary codec (`codec.go`): uvarints, length-prefixed fields, and every length bounds-checked against the remaining input, so garbage can't cause a panic or a huge allocation (`FuzzDecodeRPC`). JSON had been ~25% of CPU on the write path. Binary requests use new type codes. A server still answers JSON requests in JSON, and a client that gets hung up on (which is what older versions do with an unknown type) retries in JSON and remembers that peer, so clusters can be upgraded one node at a time. That was verified with a cluster of two old nodes and one new node, with the new node leading.
+
+AppendEntries batches are capped at 4 MiB of commands. Without the cap, a follower more than 32 MiB behind (the old message limit) received an oversized message on every attempt, never caught up, and campaigned forever. Snapshots get a separate 2 GiB message limit, since they carry the whole state machine.
+
 ### Linearizable reads: ReadIndex
 
 Reading from local state is fast but not safe. A follower may not have applied the latest writes yet; with local reads, 200 out of 200 follower reads issued right after a write came back stale in an end-to-end test, because followers learn the commit index on the *next* heartbeat. Worse, a leader cut off by a partition keeps believing it is leader until it times out, and meanwhile the majority can elect a new leader and accept writes it will never see.
@@ -251,9 +282,19 @@ On open or write, each SSTable builds a sparse in-memory index holding the offse
 
 Each SSTable also gets a Bloom filter over its keys (`bloom.go`), built during the same scan, so the file format doesn't change. It uses 10 bits per key and 7 probes derived from one FNV-1a hash (Kirsch-Mitzenmacher), for a ~0.8% false-positive rate (0.79% measured). A "no" is exact, so a lookup for an absent key skips the table without touching its index or the disk. Tombstones are in the filter, because a delete must still be found to stop the search. A miss across three overlapping tables went from ~8 µs to ~0.24 µs; the memory cost is 1.25 bytes per key.
 
+### Leveled compaction
+
+The first design had two levels, and every L0 compaction merged *all* of L1 into one file. Write amplification therefore grew linearly with the data: 6× at 5 MB, 17× at 16 MB. The engine now uses the LevelDB scheme (`levels.go`):
+
+- **Levels:** L1–L6 hold files with disjoint key ranges, sorted by key, each about `TargetFileSize`; each level's budget is 10× the previous one. A lookup reads at most one file per level (binary search on file ranges, then the bloom filter).
+- **Compaction:** when L0 has 4 files, they merge with only the L1 files they overlap. When a level exceeds its budget, one of its files (chosen round-robin through the key space) merges with the files it overlaps one level down. Outputs are split at `TargetFileSize`.
+- **Tombstones:** a tombstone is dropped only when no deeper level has a file covering its key. Otherwise it must keep shadowing the older value below. The randomized model test catches dropping them unconditionally.
+
+Write amplification for scattered keys is now 5.9× / 10.2× / 13.7× at 200k / 600k / 1.8M keys, growing with the number of levels rather than the data size.
+
 ### Durability and recovery
 
-SSTables are written to a `.tmp` file, fsynced, renamed, and the directory fsynced. `Open` reloads them. Compaction always gives its L1 output a higher ID than every input and makes it visible before deleting the inputs, so if a crash interrupts the deletions, `Open` knows any file with a lower ID than the newest L1 has already been merged and discards it. Compaction writes an L1 file even when everything was deleted, because that file's ID is what marks the inputs obsolete.
+SSTables are written to a `.tmp` file, fsynced, renamed, and the directory fsynced. Which files are live is recorded in a `MANIFEST`: a log of atomic edits (files added, files deleted), each a checksummed `internal/wal` record. Every change follows the same order: make the new SSTables durable, append the edit and fsync it, then delete the old files. On open, the manifest decides what is live, and any other `.sst` file (output of a compaction interrupted before its edit, or input whose deletion was interrupted) is removed. The manifest is rewritten from scratch after 1,000 edits. Directories written before the manifest existed are opened with the old two-level rule, then given one.
 
 ### Write path
 

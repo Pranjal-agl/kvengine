@@ -99,7 +99,20 @@ GetLargeSSTable (100k)        ~2.6 ms/op      ~3.4 us/op
 
 An earlier version measured LSM Put at ~60 ns, but that was an in-memory write with no WAL: unflushed data was lost on crash. With a WAL, the honest comparison is fsync against fsync. The LSM's advantages are memory (data can exceed RAM) and bounded files, not raw write speed.
 
-What's left compared with production LSMs (LevelDB, RocksDB): a block cache, and a multi-level compaction scheme. Here every compaction rewrites all of L1.
+### Write amplification
+
+SSTable bytes written per user byte while loading N unique keys in scattered order (`BenchmarkLSMWriteAmplification`, small memtable and proportionally scaled levels):
+
+```
+keys        two levels (before)    leveled (after)
+200k        6.0x                   5.9x
+600k        16.8x                  10.2x
+1.8M        (not run; linear)      13.7x
+```
+
+With two levels, every L0 compaction rewrote all of L1, so the cost grew in proportion to the data. With leveled compaction it grows with the number of levels. The 600k-key load also went from 10.9 s to 5.3 s.
+
+What's left compared with production LSMs (LevelDB, RocksDB): a block cache, and compaction in the background instead of on the write that triggers it.
 
 ---
 
@@ -127,6 +140,7 @@ baseline                           2.06 ms    1.19 ms      69 us        72 us   
 + pooled TCP connections              -          -         23 us         5.9 us      36 us
 + append-only Raft log             0.48 ms    0.25 ms         -            -            -
 + batched leader fsync             0.36 ms    0.19 ms         -            -            -
++ binary RPC encoding              0.32 ms    0.14 ms      15 us        5.2 us       23 us
 ```
 
 ```bash

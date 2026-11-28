@@ -427,3 +427,49 @@ func TestEvenSplitHasNoQuorum(t *testing.T) {
 		t.Fatal("2 of 4 committed an entry")
 	}
 }
+
+// Liveness: a leader that can still reach a minority (but not a majority)
+// must not keep that minority loyal forever. 4 members; the leader can
+// only reach A. It can't commit (needs 3 of 4), and B and C can't win an
+// election without A's vote — which A withholds while it hears from a
+// leader (§4.2.3). Without CheckQuorum (the leader stepping down once it
+// can't hear a majority) the cluster stalls until the partition heals.
+func TestLeaderWithoutQuorumStepsDown(t *testing.T) {
+	c := newMCluster(t, 3, "")
+	c.propose("a")
+	c.start("m3", Membership{})
+	c.change(func(l *Node) (uint64, uint64, error) { return l.AddServer("m3", "") })
+	c.propose("b")
+
+	lid, old := c.leader()
+	var others []string
+	for _, id := range []string{"m0", "m1", "m2", "m3"} {
+		if id != lid {
+			others = append(others, id)
+		}
+	}
+	a := others[0]
+	for _, x := range others[1:] { // leader keeps only its link to A
+		c.tr.Partition(lid, x)
+		c.tr.Partition(x, lid)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		for _, id := range others {
+			if n := c.node(id); n.State().Role == Leader {
+				idx, term, ok := n.Propose([]byte("after"))
+				if ok && n.WaitCommitted(idx, term, time.Second) == nil {
+					if old.State().Role == Leader && old.State().Term >= n.State().Term {
+						t.Fatal("old leader still leads in the new leader's term")
+					}
+					return
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("cluster stalled: %s (reaching only %s) kept leading; state %+v", lid, a, old.State())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
