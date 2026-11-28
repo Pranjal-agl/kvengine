@@ -385,6 +385,9 @@ func (n *Node) canChangeConfig() error {
 	if n.configIndex > n.commitIndex || len(n.learners) > 0 {
 		return ErrConfigChangeInProgress
 	}
+	if n.transferTo != "" {
+		return ErrTransferInProgress
+	}
 	return nil
 }
 
@@ -461,6 +464,7 @@ func (n *Node) WaitCommitted(index, term uint64, timeout time.Duration) error {
 // (thesis §4.2.2). Called with mu held after commitIndex advances.
 func (n *Node) stepDownIfRemoved() {
 	if n.role == Leader && !n.isMember(n.id) && n.commitIndex >= n.configIndex {
+		n.handOffAfterRemoval()
 		n.role = Follower
 		n.leaderId = ""
 		n.signal()

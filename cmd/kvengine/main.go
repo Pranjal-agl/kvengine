@@ -21,7 +21,7 @@
 //
 //	# Grow or shrink a running cluster (send to any node; it must reach the leader):
 //	#   start the new node with --join, then on the leader:
-//	ADDNODE <id> <raftAddr>      REMOVENODE <id>      MEMBERS
+//	ADDNODE <id> <raftAddr>      REMOVENODE <id>      MEMBERS      TRANSFER [<id>]
 //	  e.g. (node 0 of 3):
 //	    kvengine raft --id node0 \
 //	      --peers "node1=127.0.0.1:7001,node2=127.0.0.1:7002" \
@@ -43,6 +43,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"kvengine/internal/raft"
 	"kvengine/internal/raftkv"
@@ -218,6 +219,16 @@ func runRaft(args []string) {
 	srv := server.New(kv)
 	shutdownOnSignal(func() {
 		srv.Close()
+		// Hand leadership over before going away, so the rest of the
+		// cluster has a leader within a round trip instead of after an
+		// election timeout (a rolling restart then has no write gap).
+		if node.State().Role == raft.Leader && len(node.Members()) > 1 {
+			if err := node.TransferLeadership("", time.Second); err != nil {
+				log.Printf("[%s] leadership transfer before shutdown: %v", *id, err)
+			} else {
+				log.Printf("[%s] handed leadership over before shutdown", *id)
+			}
+		}
 		transport.Close()
 		node.Stop()
 		kv.Close()
@@ -269,7 +280,7 @@ Raft cluster node:
 
   Membership changes (one at a time, sent to the leader's KV port):
     start the new node with --join (no --peers needed), then
-    ADDNODE <id> <raftAddr> | REMOVENODE <id> | MEMBERS
+    ADDNODE <id> <raftAddr> | REMOVENODE <id> | MEMBERS | TRANSFER [<id>]
     ADDNODE first catches the new node up as a non-voter, and fails
     (leaving membership unchanged) if that takes over --catch-up-timeout.
 

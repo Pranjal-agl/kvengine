@@ -54,9 +54,12 @@ type ErrGetter interface {
 //	ADDNODE <id> <raftAddr>\r\n  ->  +OK\r\n
 //	REMOVENODE <id>\r\n          ->  +OK\r\n
 //	MEMBERS\r\n                   ->  $<len>\r\n<"id addr [leader]" lines>\r\n
+//	TRANSFER [<id>]\r\n           ->  +OK\r\n  (leadership to id, or to the
+//	                                         most up-to-date member)
 type Admin interface {
 	AddNode(id, addr string) error
 	RemoveNode(id string) error
+	TransferLeader(id string) error
 	MembersInfo() string
 }
 
@@ -209,7 +212,7 @@ func (srv *Server) handleConn(conn net.Conn) {
 			srv.handleGet(w, fields)
 		case "DEL":
 			srv.handleDel(w, fields)
-		case "ADDNODE", "REMOVENODE", "MEMBERS":
+		case "ADDNODE", "REMOVENODE", "MEMBERS", "TRANSFER":
 			srv.handleAdmin(w, cmd, fields)
 		default:
 			writeErr(w, fmt.Errorf("unknown command %q", cmd))
@@ -356,12 +359,18 @@ func (srv *Server) handleAdmin(w *bufio.Writer, cmd string, fields []string) {
 		err = admin.AddNode(fields[1], fields[2])
 	case cmd == "REMOVENODE" && len(fields) == 2:
 		err = admin.RemoveNode(fields[1])
+	case cmd == "TRANSFER" && len(fields) <= 2:
+		target := ""
+		if len(fields) == 2 {
+			target = fields[1]
+		}
+		err = admin.TransferLeader(target)
 	case cmd == "MEMBERS" && len(fields) == 1:
 		info := admin.MembersInfo()
 		fmt.Fprintf(w, "$%d\r\n%s\r\n", len(info), info)
 		return
 	default:
-		writeErr(w, fmt.Errorf("usage: ADDNODE <id> <raftAddr> | REMOVENODE <id> | MEMBERS"))
+		writeErr(w, fmt.Errorf("usage: ADDNODE <id> <raftAddr> | REMOVENODE <id> | MEMBERS | TRANSFER [<id>]"))
 		return
 	}
 	if err != nil {

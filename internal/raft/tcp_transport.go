@@ -25,6 +25,13 @@ const (
 	// Offset and More). A separate type, so a whole snapshot is still sent
 	// exactly as before and older peers keep understanding it.
 	rpcSnapshotChunk rpcType = 5
+	// rpcTimeoutNow asks a member to campaign now (leadership transfer).
+	rpcTimeoutNow rpcType = 6
+	// rpcRequestVoteTransfer: a RequestVote with Transfer set. The payload
+	// is an ordinary RequestVote; the type carries the flag, so plain
+	// RequestVotes stay byte-for-byte what older peers expect, and an older
+	// peer simply hangs up on this one (no vote).
+	rpcRequestVoteTransfer rpcType = 7
 
 	// rpcBinary marks a payload in the binary codec (codec.go). Requests
 	// are always sent binary; the server also still answers JSON requests
@@ -292,12 +299,19 @@ func dispatch(node *Node, env rpcEnvelope) (reply any, ok bool) {
 		decode = func(v any) bool { return decodeRPC(env.Payload, v) == nil }
 	}
 	switch env.Type &^ rpcBinary {
-	case rpcRequestVote:
+	case rpcRequestVote, rpcRequestVoteTransfer:
 		var args RequestVoteArgs
 		if !decode(&args) {
 			return nil, false
 		}
+		args.Transfer = env.Type&^rpcBinary == rpcRequestVoteTransfer
 		return node.HandleRequestVote(args), true
+	case rpcTimeoutNow:
+		var args TimeoutNowArgs
+		if !decode(&args) {
+			return nil, false
+		}
+		return node.HandleTimeoutNow(args), true
 	case rpcAppendEntries:
 		var args AppendEntriesArgs
 		if !decode(&args) {
@@ -469,9 +483,19 @@ func roundTrip(c *clientConn, typ rpcType, payload []byte) (rpcEnvelope, error) 
 	return readEnvelope(c.r)
 }
 
+func (t *TCPTransport) TimeoutNow(peer string, args TimeoutNowArgs) (TimeoutNowReply, error) {
+	var reply TimeoutNowReply
+	err := t.call(peer, rpcTimeoutNow, args, &reply)
+	return reply, err
+}
+
 func (t *TCPTransport) RequestVote(peer string, args RequestVoteArgs) (RequestVoteReply, error) {
 	var reply RequestVoteReply
-	err := t.call(peer, rpcRequestVote, args, &reply)
+	typ := rpcRequestVote
+	if args.Transfer {
+		typ = rpcRequestVoteTransfer
+	}
+	err := t.call(peer, typ, args, &reply)
 	return reply, err
 }
 

@@ -129,7 +129,47 @@ Load time           7.2-7.6 s              5.0-5.3 s
 
 The worst case drops ~15x for writes and ~25x for reads, since nobody waits for a whole merge any more; what remains of the Put maximum is a MemTable flush (still on the writer, bounded by MemTableSize). The trade is the tail just below it: on this 2-vCPU VM the compactor competes with the writer and the reader for CPU, so p99.9 rises. With more cores, or a rate limit on compaction I/O, that cost would shrink.
 
-What's left compared with production LSMs (LevelDB, RocksDB): a block cache, flushing an immutable MemTable in the background as well, and compaction rate limiting.
+### Background flush: latency
+
+`BenchmarkLSMDurablePutLatency`: one writer, durable writes (fsync per write), 1 MiB MemTable, 40k writes, so several MemTables fill. Three runs each, same machine; "before" flushes on the writer that fills the MemTable:
+
+```
+                    flush on the writer    background flush
+Put p50             141-144 us             139-148 us
+Put p99.9           1.2-1.7 ms             1.3-1.9 ms
+Put p99.99          3.1-3.6 ms             3.6-4.8 ms
+Put max             17-19 ms               5.5-8.3 ms
+```
+
+Only the worst case improves (the write that used to sort and write a whole SSTable). The far tail gets a little worse, probably because the flusher's fsyncs now overlap the writer's WAL fsyncs on the same disk. In `BenchmarkLSMLatencyUnderCompaction` (NoSync, a spinning reader, 2 vCPUs, so CPU-bound) the change made no measurable difference: Put max 21-34 ms before, 18-20 ms after, p99.9 1.0-1.1 ms before, 1.2-1.3 ms after, all within run-to-run noise.
+
+### Compaction rate limit
+
+`Options.CompactionBytesPerSec` caps what compaction reads plus writes per second. Same benchmark (`BenchmarkLSMLatencyUnderCompaction`, which now has `limit=` variants), three runs each.
+
+A fixed limit, as first written, traded tail latency for stalls. The load is a burst at full speed, so a limited compaction let L0 fill to the stop limit and writes waited:
+
+```
+fixed limit    Get p99.9      Put p99.9      Put max         load time
+none           473-483 us     763-959 us     15-21 ms        4.3-4.7 s
+32 MB/s        374-450 us     742-795 us     193-420 ms      4.8-4.9 s
+16 MB/s        261-302 us     610-750 us     0.94-1.05 s     6.8-7.0 s
+8 MB/s         146-166 us     462-477 us     2.4 s           10.3-10.8 s
+```
+
+So the limit now applies only while compaction has slack. From 8 L0 files on (LevelDB's slowdown point, before the stall at 12) it runs unthrottled until it catches up:
+
+```
+limit with     Get p99.9      Put p99.9      Put max         load time
+bypass
+none           472-546 us     960-1041 us    16-19 ms        4.2-4.5 s
+16 MB/s        412-479 us     637-740 us     22-37 ms        4.0-4.2 s
+8 MB/s         381-440 us     597-771 us     17-29 ms        4.2-4.5 s
+```
+
+Put p99.9 drops by about a third and Get p99.9 by about 15%, with the same throughput and no multi-second stalls; the worst case is about the same, a little worse at 16 MB/s. It's off by default: the right number depends on the disk and the write rate, and with no limit nothing waits on purpose.
+
+What's left compared with production LSMs (LevelDB, RocksDB): a block cache.
 
 ---
 

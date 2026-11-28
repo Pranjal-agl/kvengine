@@ -196,6 +196,11 @@ func encodeRPC(v any) ([]byte, error) {
 		e.u64(m.Term)
 		e.u64(m.Next)
 		e.bool(m.Done)
+	case TimeoutNowArgs:
+		e.u64(m.Term)
+		e.str(m.LeaderId)
+	case TimeoutNowReply:
+		e.u64(m.Term)
 	case ReadIndexArgs:
 		e.str(m.From)
 	case ReadIndexReply:
@@ -268,6 +273,11 @@ func decodeRPC(b []byte, v any) error {
 		m.Term = d.u64()
 		m.Next = d.u64()
 		m.Done = d.bool()
+	case *TimeoutNowArgs:
+		m.Term = d.u64()
+		m.LeaderId = d.str()
+	case *TimeoutNowReply:
+		m.Term = d.u64()
 	case *ReadIndexArgs:
 		m.From = d.str()
 	case *ReadIndexReply:

@@ -113,9 +113,9 @@ func TestWritesStallAtL0Limit(t *testing.T) {
 	defer e.Close()
 	defer g.release() // before Close, which waits for the compactor
 
-	fillL0(t, e, l0StopWrites-1, "a")
-	// One more flush puts L0 at the limit: a write that fills the
-	// MemTable flushes, then must wait. (Flush itself never stalls.)
+	fillL0(t, e, l0StopWrites, "a")
+	// L0 is at the limit: a write that fills the MemTable must wait before
+	// it can swap in a new one. (Flush itself never stalls.)
 	big := make([]byte, opts.MemTableSize)
 	putDone := make(chan error, 1)
 	go func() { putDone <- e.Put([]byte("big"), big) }()
@@ -318,5 +318,104 @@ func TestPickCompactionScoresLevels(t *testing.T) {
 		if got != c.want {
 			t.Errorf("case %d (L0 %d files, L1 %dB, L2 %dB): compacted L%d, want L%d", i, c.l0, c.l1Bytes, c.l2Bytes, got, c.want)
 		}
+	}
+}
+
+// An engine reopened with L0 already backed up compacts straight away. It
+// used to wait for the next flush to wake the compactor, so a write that
+// stalled on L0 waited forever.
+func TestReopenWithFullL0StartsCompacting(t *testing.T) {
+	dir := t.TempDir()
+	opts := tiny()
+	opts.compactHook = func() error { return errors.New("compaction off") }
+	e, err := OpenWithOptions(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; l0Files(e) < l0StopWrites+2; i++ {
+		e.Put([]byte(fmt.Sprintf("k%05d", i)), []byte("v"))
+		if i%20 == 19 {
+			e.Flush()
+		}
+	}
+	e.Close()
+
+	e, err = OpenWithOptions(dir, tiny())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	waitFor(t, func() bool { return l0Files(e) < maxL0Tables }, "compaction to start after reopen")
+	done := make(chan error, 1)
+	go func() { done <- e.Put([]byte("after"), make([]byte, tiny().MemTableSize)) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("write hung after reopen")
+	}
+}
+
+// The compaction rate limit holds: a compaction moving B bytes (read +
+// written) takes at least about B/rate.
+func TestCompactionRateLimit(t *testing.T) {
+	const rate = 256 << 10 // 256 KiB/s
+	opts := tiny()
+	opts.CompactionBytesPerSec = rate
+	var hold atomic.Bool
+	hold.Store(true)
+	opts.compactHook = func() error {
+		if hold.Load() {
+			return errors.New("not yet")
+		}
+		return nil
+	}
+	e, err := OpenWithOptions(t.TempDir(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	for i := 0; l0Files(e) < maxL0Tables; i++ {
+		e.Put([]byte(fmt.Sprintf("k%05d", i)), []byte("0123456789abcdef0123456789abcdef"))
+	}
+	e.Flush()
+	hold.Store(false)
+	before := e.bytesWritten.Load()
+	e.mu.RLock()
+	in := levelBytes(e.levels[0])
+	e.mu.RUnlock()
+	start := time.Now()
+	if err := e.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	took := time.Since(start)
+	moved := in + (e.bytesWritten.Load() - before)
+	min := time.Duration(float64(moved) / rate * float64(time.Second))
+	t.Logf("moved %d bytes in %v (limit implies >= %v)", moved, took, min)
+	if took < min*8/10 {
+		t.Fatalf("compaction moved %d bytes in %v; at %d B/s it should take ~%v", moved, took, rate, min)
+	}
+}
+
+// Closing doesn't wait out a throttled compaction.
+func TestCloseInterruptsThrottledCompaction(t *testing.T) {
+	opts := tiny()
+	opts.CompactionBytesPerSec = 1 // absurdly slow
+	e, err := OpenWithOptions(t.TempDir(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; l0Files(e) < maxL0Tables; i++ {
+		e.Put([]byte(fmt.Sprintf("k%05d", i)), []byte("0123456789abcdef"))
+	}
+	time.Sleep(50 * time.Millisecond) // the compaction starts and throttles
+	start := time.Now()
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("Close took %v behind a throttled compaction", d)
 	}
 }

@@ -373,7 +373,12 @@ func TestGetUsesGetErr(t *testing.T) {
 
 type fakeAdmin struct {
 	KVStore
-	added, removed []string
+	added, removed, transfers []string
+}
+
+func (f *fakeAdmin) TransferLeader(id string) error {
+	f.transfers = append(f.transfers, id)
+	return nil
 }
 
 func (f *fakeAdmin) AddNode(id, addr string) error {
@@ -430,6 +435,17 @@ func TestAdminCommands(t *testing.T) {
 	}
 	if len(fa.added) != 1 || fa.added[0] != "n2@10.0.0.3:7000" {
 		t.Fatalf("added = %v", fa.added)
+	}
+	for _, cmd := range []string{"TRANSFER n1\r\n", "TRANSFER\r\n"} {
+		if got := send(cmd); got != "+OK\r\n" {
+			t.Fatalf("%q: %q", cmd, got)
+		}
+	}
+	if got := send("TRANSFER a b\r\n"); got[:4] != "-ERR" {
+		t.Fatalf("bad TRANSFER args: %q", got)
+	}
+	if len(fa.transfers) != 2 || fa.transfers[0] != "n1" || fa.transfers[1] != "" {
+		t.Fatalf("transfers = %q", fa.transfers)
 	}
 }
 

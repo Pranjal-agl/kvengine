@@ -34,6 +34,8 @@ func codecSamples() []any {
 		snapshotChunkArgs{Term: 5, LeaderId: "L", Offset: 9},
 		snapshotChunkReply{Term: 8, Next: 1 << 20, Done: true},
 		snapshotChunkReply{Term: 8},
+		TimeoutNowArgs{Term: 12, LeaderId: "L"},
+		TimeoutNowReply{Term: 13},
 		ReadIndexArgs{From: "f"},
 		ReadIndexReply{Index: 12, OK: true, LeaderId: "L"},
 	}
@@ -86,7 +88,7 @@ func FuzzDecodeRPC(f *testing.F) {
 	f.Fuzz(func(t *testing.T, b []byte) {
 		targets := []any{&RequestVoteArgs{}, &RequestVoteReply{}, &AppendEntriesArgs{}, &AppendEntriesReply{},
 			&InstallSnapshotArgs{}, &InstallSnapshotReply{}, &ReadIndexArgs{}, &ReadIndexReply{},
-			&snapshotChunkArgs{}, &snapshotChunkReply{}}
+			&snapshotChunkArgs{}, &snapshotChunkReply{}, &TimeoutNowArgs{}, &TimeoutNowReply{}}
 		for _, p := range targets {
 			if decodeRPC(b, p) != nil {
 				continue

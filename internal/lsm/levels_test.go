@@ -154,7 +154,7 @@ func TestOrphanSSTableIgnored(t *testing.T) {
 	e, _ := Open(dir)
 	e.Put([]byte("k"), []byte("real"))
 	e.Close()
-	orphan, err := writeSSTable(dir, 0, 999999, []entry{{key: "k", value: "orphan"}})
+	orphan, err := writeSSTable(dir, 0, 999999, []entry{{key: "k", value: "orphan"}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,7 +205,7 @@ func TestPreManifestDirectoryMigrates(t *testing.T) {
 		{1, 2, []entry{{key: "a", value: "1"}, {key: "b", value: "2"}}},
 		{0, 3, []entry{{key: "b", value: "3"}}},
 	} {
-		s, err := writeSSTable(dir, f.level, f.id, f.ents)
+		s, err := writeSSTable(dir, f.level, f.id, f.ents, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
