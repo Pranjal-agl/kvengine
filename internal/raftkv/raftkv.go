@@ -15,6 +15,7 @@
 package raftkv
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -73,6 +74,40 @@ type command struct {
 	Op  string `json:"op"` // "put" or "del"
 	Key []byte `json:"k"`
 	Val []byte `json:"v,omitempty"`
+}
+
+// legacyCommand is the payload v1.0 wrote: a map[string]string, so keys
+// and values are plain JSON strings rather than base64.
+type legacyCommand struct {
+	Op  string `json:"op"`
+	Key string `json:"k"`
+	Val string `json:"v"`
+}
+
+// decodeCommand decodes a log entry written by this version or by v1.0.
+//
+// The two formats share field names but not field types: v1.0 stored k and
+// v as strings, this version as base64. Decoding a v1.0 entry as base64
+// fails for most keys and, worse, silently yields different bytes for keys
+// that happen to be valid base64 ("user", "abcd"). They are told apart by
+// field order, which encoding/json fixes: v1.0 marshalled a map, whose keys
+// come out sorted ({"k":...,"op":...}); this version marshals the command
+// struct, whose fields come out in declaration order ({"op":...}).
+func decodeCommand(data []byte) (command, error) {
+	var cmd command
+	if bytes.HasPrefix(data, []byte(`{"k":`)) {
+		var old legacyCommand
+		if err := json.Unmarshal(data, &old); err != nil {
+			return cmd, err
+		}
+		cmd = command{Op: old.Op, Key: []byte(old.Key)}
+		if old.Op == "put" {
+			cmd.Val = []byte(old.Val)
+		}
+		return cmd, nil
+	}
+	err := json.Unmarshal(data, &cmd)
+	return cmd, err
 }
 
 type waiter struct {
@@ -280,9 +315,8 @@ func (kv *KV) applySnapshot(msg raft.ApplyMsg) {
 }
 
 func (kv *KV) applyCommand(msg raft.ApplyMsg) {
-	var cmd command
-	var err error
-	if err = json.Unmarshal(msg.Command, &cmd); err != nil {
+	cmd, err := decodeCommand(msg.Command)
+	if err != nil {
 		kv.opts.Logger.Printf("raftkv: skipping undecodable command at index %d: %v", msg.CommandIndex, err)
 	} else {
 		switch cmd.Op {
