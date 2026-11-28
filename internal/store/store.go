@@ -8,13 +8,35 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
+	"sync/atomic"
 
 	"kvengine/internal/wal"
 )
 
 // ErrClosed is returned by Put and Delete after Close has been called.
 var ErrClosed = errors.New("store: closed")
+
+// ErrReplicating is returned by Compact once the WAL has been handed to a
+// replication leader (WAL()): followers resume by byte offset into the
+// log, and rewriting it would invalidate those offsets.
+var ErrReplicating = errors.New("store: cannot compact a WAL that is being replicated")
+
+// Options configure a WAL-backed Store.
+type Options struct {
+	// The WAL is rewritten to just the live data (compacted) when it is
+	// both larger than CompactMinBytes and more than CompactRatio times
+	// the size of the live data. Defaults: 64 MiB and 4. A negative
+	// CompactMinBytes disables automatic compaction; Compact still works.
+	CompactMinBytes int64
+	CompactRatio    float64
+}
+
+// recordOverhead is a WAL record's framing: CRC, length, type and the two
+// length fields.
+const recordOverhead = 4 + 4 + 1 + 4 + 4
 
 // maxBatch bounds how many writes one fsync may cover. Large enough to
 // amortise fsync under heavy concurrency, small enough that a single batch
@@ -48,11 +70,19 @@ type Store struct {
 
 	closeMu sync.RWMutex // read-held for the whole of each write; write-held by Close
 	closed  bool
+
+	opts        Options
+	path        string
+	liveBytes   int64       // encoded size of the live data, if rewritten; guarded by mu
+	replicating atomic.Bool // WAL() was called; compaction is off
+	compactMu   sync.Mutex  // held for a whole compaction, and by WAL()
+	compactErr  error       // last automatic compaction failure (commit leader only)
 }
 
 type writeReq struct {
-	rec  wal.Record
-	done chan writeResult
+	rec     wal.Record
+	compact bool // a Compact() request rather than a write
+	done    chan writeResult
 }
 
 // writeResult is sent to a waiting writer either when its write has been
@@ -67,17 +97,29 @@ type writeResult struct {
 // accepting new writes — this is the crash-recovery path. A torn tail left
 // by a crash is truncated away so new writes land after the last valid
 // record (see wal.Open).
-func Open(walPath string) (*Store, error) {
+func Open(walPath string) (*Store, error) { return OpenWithOptions(walPath, Options{}) }
+
+// OpenWithOptions is Open with explicit options.
+func OpenWithOptions(walPath string, opts Options) (*Store, error) {
+	if opts.CompactMinBytes == 0 {
+		opts.CompactMinBytes = 64 << 20
+	}
+	if opts.CompactRatio <= 0 {
+		opts.CompactRatio = 4
+	}
+	os.Remove(compactTmp(walPath)) // an interrupted compaction; the old WAL is intact
 	log, records, err := wal.OpenAndReplay(walPath)
 	if err != nil {
 		return nil, fmt.Errorf("store: open: %w", err)
 	}
-	data := make(map[string][]byte, len(records))
+	s := &Store{data: make(map[string][]byte, len(records)), log: log, opts: opts, path: walPath}
 	for _, rec := range records {
-		applyRecord(data, rec)
+		s.liveBytes += applyRecord(s.data, rec)
 	}
-	return &Store{data: data, log: log}, nil
+	return s, nil
 }
+
+func compactTmp(path string) string { return path + ".compact.tmp" }
 
 // NewMemory returns a Store with no write-ahead log: writes are applied to
 // memory only and are lost on exit. Used as the Raft state machine, where
@@ -87,13 +129,22 @@ func NewMemory() *Store {
 	return &Store{data: make(map[string][]byte)}
 }
 
-func applyRecord(data map[string][]byte, rec wal.Record) {
+// applyRecord applies rec to data and returns the change in live bytes
+// (the size the live data would take in a freshly written WAL).
+func applyRecord(data map[string][]byte, rec wal.Record) int64 {
+	k := string(rec.Key)
+	var delta int64
+	if old, ok := data[k]; ok {
+		delta -= int64(recordOverhead + len(k) + len(old))
+	}
 	switch rec.Type {
 	case wal.RecordPut:
-		data[string(rec.Key)] = rec.Value
+		data[k] = rec.Value
+		delta += int64(recordOverhead + len(k) + len(rec.Value))
 	case wal.RecordDelete:
-		delete(data, string(rec.Key))
+		delete(data, k)
 	}
+	return delta
 }
 
 // Put durably writes key=value. Returns once the record is fsynced and
@@ -112,14 +163,29 @@ func (s *Store) Delete(key []byte) error {
 	return s.write(wal.Record{Type: wal.RecordDelete, Key: append([]byte(nil), key...)})
 }
 
+// Compact rewrites the WAL to contain only the live data, reclaiming the
+// space of overwritten and deleted records. Writes queue behind it while
+// it runs (it holds the commit leadership); reads are not blocked. The new
+// log is fully written and fsynced before it atomically replaces the old
+// one, so a crash at any point leaves one complete log.
+func (s *Store) Compact() error {
+	if s.path == "" {
+		return nil // in-memory store: nothing to compact
+	}
+	return s.submit(&writeReq{compact: true, done: make(chan writeResult, 1)})
+}
+
 func (s *Store) write(rec wal.Record) error {
+	return s.submit(&writeReq{rec: rec, done: make(chan writeResult, 1)})
+}
+
+func (s *Store) submit(req *writeReq) error {
 	s.closeMu.RLock()
 	defer s.closeMu.RUnlock()
 	if s.closed {
 		return ErrClosed
 	}
 
-	req := &writeReq{rec: rec, done: make(chan writeResult, 1)}
 	s.wmu.Lock()
 	s.queue = append(s.queue, req)
 	if s.committing {
@@ -159,8 +225,13 @@ func (s *Store) write(rec wal.Record) error {
 
 func (s *Store) commit(batch []*writeReq) {
 	var err error
+	compactAsked := false
 	if s.log != nil {
 		for _, r := range batch {
+			if r.compact {
+				compactAsked = true
+				continue
+			}
 			if err = s.log.Append(r.rec); err != nil {
 				break
 			}
@@ -172,16 +243,121 @@ func (s *Store) commit(batch []*writeReq) {
 	if err == nil {
 		s.mu.Lock()
 		for _, r := range batch {
-			applyRecord(s.data, r.rec)
+			if !r.compact {
+				s.liveBytes += applyRecord(s.data, r.rec)
+			}
 		}
 		s.mu.Unlock()
 	}
-	// On error nothing is applied to memory and every writer in the batch
-	// is told it failed. Some of the batch may still have reached disk;
-	// as with any fsync failure, the caller cannot assume either outcome.
+
+	// Compaction runs here because the commit leader is the only writer:
+	// nothing can be appended between taking the snapshot and swapping
+	// the log in.
+	var cerr error
+	if compactAsked || (err == nil && s.shouldCompact()) {
+		cerr = s.compactLocked()
+		if !compactAsked {
+			s.compactErr = cerr // automatic: don't fail the writes over it
+		}
+	}
+
+	// On a write error nothing is applied to memory and every writer in
+	// the batch is told it failed. Some of the batch may still have
+	// reached disk; as with any fsync failure, the caller cannot assume
+	// either outcome.
 	for _, r := range batch {
+		if r.compact {
+			if err != nil {
+				r.done <- writeResult{err: err}
+			} else {
+				r.done <- writeResult{err: cerr}
+			}
+			continue
+		}
 		r.done <- writeResult{err: err}
 	}
+}
+
+func (s *Store) shouldCompact() bool {
+	if s.log == nil || s.opts.CompactMinBytes < 0 || s.replicating.Load() {
+		return false
+	}
+	size := s.log.DurableOffset()
+	s.mu.RLock()
+	live := s.liveBytes
+	s.mu.RUnlock()
+	return size > s.opts.CompactMinBytes && float64(size) > s.opts.CompactRatio*float64(live)
+}
+
+// compactLocked rewrites the WAL as one Put per live key. Called by the
+// commit leader.
+func (s *Store) compactLocked() error {
+	s.compactMu.Lock()
+	defer s.compactMu.Unlock()
+	if s.replicating.Load() {
+		return ErrReplicating
+	}
+	tmp := compactTmp(s.path)
+	os.Remove(tmp)
+	w, err := wal.Open(tmp)
+	if err != nil {
+		return fmt.Errorf("store: compact: %w", err)
+	}
+	s.mu.RLock() // readers continue; writers are queued behind us
+	for k, v := range s.data {
+		if err = w.Append(wal.Record{Type: wal.RecordPut, Key: []byte(k), Value: v}); err != nil {
+			break
+		}
+	}
+	s.mu.RUnlock()
+	if err == nil {
+		err = w.Sync()
+	}
+	if cerr := w.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Rename(tmp, s.path)
+	}
+	if err == nil {
+		err = syncDir(filepath.Dir(s.path))
+	}
+	if err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("store: compact: %w", err)
+	}
+	nw, err := wal.Open(s.path)
+	if err != nil {
+		// The new log is in place but can't be reopened for appends;
+		// writes will fail until restart, which recovers from it.
+		return fmt.Errorf("store: compact: reopen: %w", err)
+	}
+	s.mu.Lock() // WALSize reads s.log under mu
+	old := s.log
+	s.log = nw
+	s.mu.Unlock()
+	old.Close()
+	return nil
+}
+
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
+}
+
+// WALSize returns the current size of the WAL in bytes (0 for in-memory
+// stores). Mostly for tests and monitoring.
+func (s *Store) WALSize() int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.log == nil {
+		return 0
+	}
+	return s.log.DurableOffset()
 }
 
 // Get returns the value for key and whether it was present.
@@ -241,8 +417,13 @@ func (s *Store) RestoreSnapshot(data []byte) error {
 	} else if legacyErr := json.Unmarshal(data, &fresh); legacyErr != nil {
 		return fmt.Errorf("store: restore snapshot: %w", err)
 	}
+	var live int64
+	for k, v := range fresh {
+		live += int64(recordOverhead + len(k) + len(v))
+	}
 	s.mu.Lock()
 	s.data = fresh
+	s.liveBytes = live
 	s.mu.Unlock()
 	return nil
 }
@@ -252,6 +433,13 @@ func (s *Store) RestoreSnapshot(data []byte) error {
 // wal.StreamFrom. Not for general use — callers should go through Store's
 // Put/Get/Delete API.
 func (s *Store) WAL() *wal.WAL {
+	// Wait out any compaction in progress, then disable compaction:
+	// followers' offsets into this file must stay valid.
+	s.compactMu.Lock()
+	defer s.compactMu.Unlock()
+	s.replicating.Store(true)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.log
 }
 
